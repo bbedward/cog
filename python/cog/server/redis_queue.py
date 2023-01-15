@@ -302,6 +302,7 @@ class RedisQueueWorker:
         was_canceled = False
         done_event = None
         output_type = None
+        had_error = False
 
         try:
             for event in self.worker.predict(payload=input_obj.dict(), poll=0.1):
@@ -339,16 +340,20 @@ class RedisQueueWorker:
                         output_type is not None
                     ), "Predictor returned unexpected output"
 
-                    output = self.upload_files(event.payload)
 
-                    if output_type.multi:
-                        response["output"].append(output)
-                        yield (WebhookEvent.OUTPUT, response)
-                    else:
-                        assert (
-                            response["output"] is None
-                        ), "Predictor unexpectedly returned multiple outputs"
-                        response["output"] = output
+                    try:
+                        output = self.upload_files(event.payload)
+
+                        if output_type.multi:
+                            response["output"].append(output)
+                            yield (WebhookEvent.OUTPUT, response)
+                        else:
+                            assert (
+                                response["output"] is None
+                            ), "Predictor unexpectedly returned multiple outputs"
+                            response["output"] = output
+                    except Exception:
+                        had_error = True
 
                 elif isinstance(event, Done):
                     assert not done_event, "Predictor unexpectedly returned done twice"
@@ -362,7 +367,10 @@ class RedisQueueWorker:
             # It should only be possible to get here if we got a done event.
             assert done_event
 
-            if done_event.canceled and was_canceled:
+            if had_error:
+                response["status"] = Status.FAILED
+                response["error"] = "Error uploading files"
+            elif done_event.canceled and was_canceled:
                 response["status"] = Status.CANCELED
             elif done_event.canceled and timed_out:
                 response["status"] = Status.FAILED
@@ -410,13 +418,22 @@ class RedisQueueWorker:
         def upload_file(fh: io.IOBase) -> str:
             filename = guess_filename(fh)
             content_type, _ = guess_type(filename)
+            retries = 0
 
-            resp = requests.put(
-                ensure_trailing_slash(self.upload_url) + filename,
-                fh,  # type: ignore
-                headers={"Content-type": content_type},
-            )
-            resp.raise_for_status()
+            while retries < 3:
+                try:
+                    resp = requests.put(
+                        ensure_trailing_slash(self.upload_url) + filename,
+                        fh,  # type: ignore
+                        headers={"Content-type": content_type},
+                    )
+                    resp.raise_for_status()
+                except Exception as e:
+                    sys.stderr.write(f"Upload failed for {filename}, try number {retries + 1}: {e}")
+                    retries += 1
+                    if retries >= 3:
+                        sys.stderr.write(f"Upload failed for {filename} after 3 tries, raising error {e}")
+                        raise Exception(f"Upload failed for {filename} after 3 tries")
 
             # strip any signing gubbins from the URL
             final_url = urlparse(resp.url)._replace(query="").geturl()
