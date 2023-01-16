@@ -131,6 +131,7 @@ class RedisQueueWorker:
         return key.decode(), raw_message[b"value"].decode()
 
     def start(self) -> None:
+        sys.stderr.write("Starting worker... v1673808327 \n")
         with self.tracer.start_as_current_span(name="redis_queue.setup") as span:
             signal.signal(signal.SIGTERM, self.signal_exit)
             started_at = datetime.datetime.now()
@@ -428,6 +429,7 @@ class RedisQueueWorker:
                         headers={"Content-type": content_type},
                     )
                     resp.raise_for_status()
+                    break
                 except Exception as e:
                     sys.stderr.write(f"Upload failed for {filename}, try number {retries + 1}: {e}")
                     retries += 1
