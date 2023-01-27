@@ -24,17 +24,3 @@ jobs:
           args: release --rm-dist
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build Python package
-        run: |
-          # clean package built for go client
-          rm -rf python/dist
-          # install build
-          pip install build
-          # build package
-          python -m build python/ --wheel
-      - name: Push Python package
-        uses: pypa/gh-action-pypi-publish@master
-        with:
-          user: __token__
-          password: ${{ secrets.PYPI_TOKEN }}
-          packages_dir: python/dist
