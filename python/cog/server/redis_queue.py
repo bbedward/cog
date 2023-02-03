@@ -349,7 +349,8 @@ class RedisQueueWorker:
                                 response["output"] is None
                             ), "Predictor unexpectedly returned multiple outputs"
                             response["output"] = output
-                    except Exception:
+                    except Exception as e:
+                        sys.stderr.write(f"Error uploading files to S3: {e}")
                         had_error = True
 
                 elif isinstance(event, Done):
