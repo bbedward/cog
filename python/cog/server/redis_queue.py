@@ -16,6 +16,7 @@ from boto3_type_annotations.s3 import ServiceResource
 from botocore.config import Config
 import redis
 import requests
+import uuid
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.trace import TracerProvider
@@ -338,7 +339,7 @@ class RedisQueueWorker:
 
                     try:
                         output = self.upload_files(
-                            event.payload, input_obj.dict()["upload_path"]
+                            event.payload, input_obj.dict()["upload_path_prefix"]
                         )
 
                         if output_type.multi:
@@ -412,19 +413,21 @@ class RedisQueueWorker:
 
         return checker
 
-    def upload_files(self, obj: Any, upload_path: str) -> Any:
+    def upload_files(self, obj: Any, upload_path_prefix: str) -> Any:
         def upload_file(fh: io.IOBase) -> str:
             filename = guess_filename(fh)
             _, extension = os.path.splitext(filename)
             if extension == ".jpg":
                 extension = ".jpeg"
 
-            self.s3_client.Bucket(self.s3_bucket).upload_fileobj(
-                fh, f"{upload_path}.{extension}"
-            )
+            key = f"{str(uuid.uuid4())}.{extension}"
+            if upload_path_prefix is not None and upload_path_prefix != "":
+                key = f"{ensure_trailing_slash(upload_path_prefix)}{key}"
+
+            self.s3_client.Bucket(self.s3_bucket).upload_fileobj(fh, key)
 
             #  URL will be bucket/path.extension
-            final_url = f"{self.s3_bucket}/{upload_path}.{extension}"
+            final_url = f"{self.s3_bucket}/{key}"
 
             return final_url
 
