@@ -1,3 +1,4 @@
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -10,9 +11,75 @@ import unittest.mock as mock
 
 from .util import docker_run, random_string
 
+
+class match:
+    def __init__(self, pattern):
+        self.pattern = pattern
+
+    def __eq__(self, other):
+        if not isinstance(other, dict):
+            return self.pattern == other
+        minimal = {k: other[k] for k in self.pattern.keys() if k in other}
+        return self.pattern == minimal
+
+    def __repr__(self):
+        return f"match({repr(self.pattern)})"
+
+
 DEFAULT_ENV = {
     "COG_THROTTLE_RESPONSE_INTERVAL": "0",
 }
+
+
+def model_running(
+    docker_image, docker_network, predict_timeout=None, report_setup_run_url=None
+):
+    director_command = [
+        "python",
+        "-m",
+        "cog.director",
+        "--redis-consumer-id=test-worker",
+        "--redis-input-queue=predict-queue",
+        "--redis-url=redis://redis:6379/0",
+    ]
+
+    if predict_timeout is not None:
+        director_command.append(f"--predict-timeout={predict_timeout}")
+
+    if report_setup_run_url is not None:
+        director_command.append(f"--report-setup-run-url={report_setup_run_url}")
+
+    model_command = [
+        "python",
+        "-m",
+        "cog.server.http",
+        "--upload-url=http://upload-server:5000/upload",
+        "--await-explicit-shutdown=true",
+    ]
+
+    director_name = random_string(10)
+
+    stack = ExitStack()
+    stack.enter_context(
+        docker_run(
+            image=docker_image,
+            interactive=True,
+            name=director_name,
+            network=docker_network,
+            command=director_command,
+            env=DEFAULT_ENV,
+        )
+    )
+    stack.enter_context(
+        docker_run(
+            image=docker_image,
+            interactive=True,
+            network=f"container:{director_name}",
+            command=model_command,
+            env=DEFAULT_ENV,
+        )
+    )
+    return stack
 
 
 @pytest.fixture(scope="session")
@@ -34,22 +101,7 @@ def test_queue_worker_files(
     with open(upload_server / "input.txt", "w") as f:
         f.write("test")
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "--redis-url=redis://redis:6379/0",
-            "--input-queue=predict-queue",
-            "--upload-url=http://upload-server:5000/upload",
-            "--consumer-id=test-worker",
-            "--model-id=model_id",
-        ],
-        env=DEFAULT_ENV,
-    ):
+    with model_running(docker_image, docker_network):
         predict_id = random_string(10)
         webhook_url = httpserver.url_for("/webhook").replace(
             "localhost", "host.docker.internal"
@@ -58,18 +110,20 @@ def test_queue_worker_files(
         # we expect a webhook on starting
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "text": "baz",
-                    "path": "http://upload-server:5000/files/input.txt",
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "text": "baz",
+                        "path": "http://upload-server:5000/files/input.txt",
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
@@ -82,22 +136,24 @@ def test_queue_worker_files(
         # and another on finishing
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "text": "baz",
-                    "path": "http://upload-server:5000/files/input.txt",
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": "http://upload-server:5000/files/output.txt",
-                "status": "succeeded",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-                "metrics": {
-                    "predict_time": mock.ANY,
-                },
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "text": "baz",
+                        "path": "http://upload-server:5000/files/input.txt",
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": "http://upload-server:5000/files/output.txt",
+                    "status": "succeeded",
+                    "started_at": mock.ANY,
+                    "completed_at": mock.ANY,
+                    "metrics": {
+                        "predict_time": mock.ANY,
+                    },
+                }
+            ),
             method="POST",
         ).respond_with_handler(capture_final_response)
 
@@ -116,6 +172,7 @@ def test_queue_worker_files(
                                 "text": "baz",
                                 "path": "http://upload-server:5000/files/input.txt",
                             },
+                            "version": "abcde",
                             "webhook": webhook_url,
                         }
                     ),
@@ -126,11 +183,11 @@ def test_queue_worker_files(
         assert waiting.result
 
         assert re.match(
-            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{6}Z",
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{6}(Z|\+00:00)",
             final_response["started_at"],
         )
         assert re.match(
-            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{6}Z",
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{6}(Z|\+00:00)",
             final_response["completed_at"],
         )
         assert type(final_response["metrics"]["predict_time"]) == float
@@ -148,24 +205,7 @@ def test_queue_worker_yielding_file(
     with open(upload_server / "input.txt", "w") as f:
         f.write("test")
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "redis",
-            "6379",
-            "predict-queue",
-            "http://upload-server:5000/upload",
-            "test-worker",
-            "model_id",
-            "logs",
-        ],
-        env=DEFAULT_ENV,
-    ):
+    with model_running(docker_image, docker_network):
         predict_id = random_string(10)
         webhook_url = httpserver.url_for("/webhook").replace(
             "localhost", "host.docker.internal"
@@ -173,96 +213,106 @@ def test_queue_worker_yielding_file(
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "path": "http://upload-server:5000/files/input.txt",
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "path": "http://upload-server:5000/files/input.txt",
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "path": "http://upload-server:5000/files/input.txt",
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": ["http://upload-server:5000/files/out-0.txt"],
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "path": "http://upload-server:5000/files/input.txt",
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": ["http://upload-server:5000/files/out-0.txt"],
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "path": "http://upload-server:5000/files/input.txt",
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": [
-                    "http://upload-server:5000/files/out-0.txt",
-                    "http://upload-server:5000/files/out-1.txt",
-                ],
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "path": "http://upload-server:5000/files/input.txt",
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": [
+                        "http://upload-server:5000/files/out-0.txt",
+                        "http://upload-server:5000/files/out-1.txt",
+                    ],
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "path": "http://upload-server:5000/files/input.txt",
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": [
-                    "http://upload-server:5000/files/out-0.txt",
-                    "http://upload-server:5000/files/out-1.txt",
-                    "http://upload-server:5000/files/out-2.txt",
-                ],
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "path": "http://upload-server:5000/files/input.txt",
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": [
+                        "http://upload-server:5000/files/out-0.txt",
+                        "http://upload-server:5000/files/out-1.txt",
+                        "http://upload-server:5000/files/out-2.txt",
+                    ],
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "path": "http://upload-server:5000/files/input.txt",
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": [
-                    "http://upload-server:5000/files/out-0.txt",
-                    "http://upload-server:5000/files/out-1.txt",
-                    "http://upload-server:5000/files/out-2.txt",
-                ],
-                "status": "succeeded",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-                "metrics": {
-                    "predict_time": mock.ANY,
-                },
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "path": "http://upload-server:5000/files/input.txt",
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": [
+                        "http://upload-server:5000/files/out-0.txt",
+                        "http://upload-server:5000/files/out-1.txt",
+                        "http://upload-server:5000/files/out-2.txt",
+                    ],
+                    "status": "succeeded",
+                    "started_at": mock.ANY,
+                    "completed_at": mock.ANY,
+                    "metrics": {
+                        "predict_time": mock.ANY,
+                    },
+                }
+            ),
             method="POST",
         )
 
@@ -280,6 +330,7 @@ def test_queue_worker_yielding_file(
                             "input": {
                                 "path": "http://upload-server:5000/files/input.txt",
                             },
+                            "version": "abcde",
                             "webhook": webhook_url,
                         }
                     ),
@@ -301,24 +352,7 @@ def test_queue_worker_yielding(docker_network, docker_image, redis_client, https
     project_dir = Path(__file__).parent / "fixtures/yielding-project"
     subprocess.run(["cog", "build", "-t", docker_image], check=True, cwd=project_dir)
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "redis",
-            "6379",
-            "predict-queue",
-            "",
-            "test-worker",
-            "model_id",
-            "logs",
-        ],
-        env=DEFAULT_ENV,
-    ):
+    with model_running(docker_image, docker_network):
         predict_id = random_string(10)
         webhook_url = httpserver.url_for("/webhook").replace(
             "localhost", "host.docker.internal"
@@ -326,54 +360,60 @@ def test_queue_worker_yielding(docker_network, docker_image, redis_client, https
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "text": "bar",
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
-            method="POST",
-        )
-
-        for output in [["foo"], ["foo", "bar"], ["foo", "bar", "baz"]]:
-            httpserver.expect_oneshot_request(
-                "/webhook",
-                json={
+            json=match(
+                {
                     "id": predict_id,
                     "input": {
                         "text": "bar",
                     },
                     "webhook": webhook_url,
                     "logs": "",
-                    "output": output,
+                    "output": None,
                     "status": "processing",
                     "started_at": mock.ANY,
-                },
+                }
+            ),
+            method="POST",
+        )
+
+        for output in [["foo"], ["foo", "bar"], ["foo", "bar", "baz"]]:
+            httpserver.expect_oneshot_request(
+                "/webhook",
+                json=match(
+                    {
+                        "id": predict_id,
+                        "input": {
+                            "text": "bar",
+                        },
+                        "webhook": webhook_url,
+                        "logs": "",
+                        "output": output,
+                        "status": "processing",
+                        "started_at": mock.ANY,
+                    }
+                ),
                 method="POST",
             )
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "text": "bar",
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": ["foo", "bar", "baz"],
-                "status": "succeeded",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-                "metrics": {
-                    "predict_time": mock.ANY,
-                },
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "text": "bar",
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": ["foo", "bar", "baz"],
+                    "status": "succeeded",
+                    "started_at": mock.ANY,
+                    "completed_at": mock.ANY,
+                    "metrics": {
+                        "predict_time": mock.ANY,
+                    },
+                }
+            ),
             method="POST",
         )
 
@@ -391,6 +431,7 @@ def test_queue_worker_yielding(docker_network, docker_image, redis_client, https
                             "input": {
                                 "text": "bar",
                             },
+                            "version": "abcde",
                             "webhook": webhook_url,
                         }
                     ),
@@ -405,24 +446,7 @@ def test_queue_worker_error(docker_network, docker_image, redis_client, httpserv
     project_dir = Path(__file__).parent / "fixtures/failing-project"
     subprocess.run(["cog", "build", "-t", docker_image], check=True, cwd=project_dir)
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "redis",
-            "6379",
-            "predict-queue",
-            "",
-            "test-worker",
-            "model_id",
-            "logs",
-        ],
-        env=DEFAULT_ENV,
-    ):
+    with model_running(docker_image, docker_network):
         predict_id = random_string(10)
         webhook_url = httpserver.url_for("/webhook").replace(
             "localhost", "host.docker.internal"
@@ -430,17 +454,19 @@ def test_queue_worker_error(docker_network, docker_image, redis_client, httpserv
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "text": "bar",
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "text": "bar",
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
@@ -450,17 +476,19 @@ def test_queue_worker_error(docker_network, docker_image, redis_client, httpserv
         # handler which can be, but does not have to be, called.
         httpserver.expect_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "text": "bar",
-                },
-                "webhook": webhook_url,
-                "logs": mock.ANY,  # includes a stack trace
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "text": "bar",
+                    },
+                    "webhook": webhook_url,
+                    "logs": mock.ANY,  # includes a stack trace
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_data("OK")
 
@@ -472,19 +500,21 @@ def test_queue_worker_error(docker_network, docker_image, redis_client, httpserv
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "text": "bar",
-                },
-                "webhook": webhook_url,
-                "error": "over budget",
-                "logs": mock.ANY,  # might include a stack trace (see above)
-                "output": None,
-                "status": "failed",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "text": "bar",
+                    },
+                    "webhook": webhook_url,
+                    "error": "over budget",
+                    "logs": mock.ANY,  # might include a stack trace (see above)
+                    "output": None,
+                    "status": "failed",
+                    "started_at": mock.ANY,
+                    "completed_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_handler(capture_final_response)
 
@@ -502,6 +532,7 @@ def test_queue_worker_error(docker_network, docker_image, redis_client, httpserv
                             "input": {
                                 "text": "bar",
                             },
+                            "version": "abcde",
                             "webhook": webhook_url,
                         }
                     ),
@@ -518,24 +549,7 @@ def test_queue_worker_error_after_output(
     project_dir = Path(__file__).parent / "fixtures/failing-after-output-project"
     subprocess.run(["cog", "build", "-t", docker_image], check=True, cwd=project_dir)
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "redis",
-            "6379",
-            "predict-queue",
-            "",
-            "test-worker",
-            "model_id",
-            "logs",
-        ],
-        env=DEFAULT_ENV,
-    ):
+    with model_running(docker_image, docker_network):
         predict_id = random_string(10)
         webhook_url = httpserver.url_for("/webhook").replace(
             "localhost", "host.docker.internal"
@@ -543,49 +557,55 @@ def test_queue_worker_error_after_output(
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "text": "bar",
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "text": "bar",
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "text": "bar",
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": ["hello bar"],
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "text": "bar",
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": ["hello bar"],
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "text": "bar",
-                },
-                "webhook": webhook_url,
-                "logs": "a printed log message\n",
-                "output": ["hello bar"],
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "text": "bar",
+                    },
+                    "webhook": webhook_url,
+                    "logs": "a printed log message\n",
+                    "output": ["hello bar"],
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
@@ -594,17 +614,19 @@ def test_queue_worker_error_after_output(
         # which can be, but does not have to be, called.
         httpserver.expect_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "text": "bar",
-                },
-                "webhook": webhook_url,
-                "logs": mock.ANY,  # includes a stack trace
-                "output": ["hello bar"],
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "text": "bar",
+                    },
+                    "webhook": webhook_url,
+                    "logs": mock.ANY,  # includes a stack trace
+                    "output": ["hello bar"],
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_data("OK")
 
@@ -616,19 +638,21 @@ def test_queue_worker_error_after_output(
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "text": "bar",
-                },
-                "webhook": webhook_url,
-                "error": "mid run error",
-                "logs": mock.ANY,  # might include a stack trace
-                "output": ["hello bar"],
-                "status": "failed",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "text": "bar",
+                    },
+                    "webhook": webhook_url,
+                    "error": "mid run error",
+                    "logs": mock.ANY,  # might include a stack trace
+                    "output": ["hello bar"],
+                    "status": "failed",
+                    "started_at": mock.ANY,
+                    "completed_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_handler(capture_final_response)
 
@@ -646,6 +670,7 @@ def test_queue_worker_error_after_output(
                             "input": {
                                 "text": "bar",
                             },
+                            "version": "abcde",
                             "webhook": webhook_url,
                         }
                     ),
@@ -665,24 +690,7 @@ def test_queue_worker_unhandled_error(
     project_dir = Path(__file__).parent / "fixtures/unhandled-error-project"
     subprocess.run(["cog", "build", "-t", docker_image], check=True, cwd=project_dir)
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "redis",
-            "6379",
-            "predict-queue",
-            "",
-            "test-worker",
-            "model_id",
-            "logs",
-        ],
-        env=DEFAULT_ENV,
-    ):
+    with model_running(docker_image, docker_network):
         predict_id = random_string(10)
         webhook_url = httpserver.url_for("/webhook").replace(
             "localhost", "host.docker.internal"
@@ -690,17 +698,19 @@ def test_queue_worker_unhandled_error(
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "text": "bar",
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "text": "bar",
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
@@ -710,17 +720,19 @@ def test_queue_worker_unhandled_error(
         # handler which can be, but does not have to be, called.
         httpserver.expect_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "text": "bar",
-                },
-                "webhook": webhook_url,
-                "logs": mock.ANY,  # includes a stack trace
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "text": "bar",
+                    },
+                    "webhook": webhook_url,
+                    "logs": mock.ANY,  # includes a stack trace
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_data("OK")
 
@@ -732,19 +744,21 @@ def test_queue_worker_unhandled_error(
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "text": "bar",
-                },
-                "webhook": webhook_url,
-                "error": "Prediction failed for an unknown reason. It might have run out of memory? (exitcode 1)",
-                "logs": mock.ANY,  # might include a stack trace (see above)
-                "output": None,
-                "status": "failed",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "text": "bar",
+                    },
+                    "webhook": webhook_url,
+                    "error": "Prediction failed for an unknown reason. It might have run out of memory? (exitcode 1)",
+                    "logs": mock.ANY,  # might include a stack trace (see above)
+                    "output": None,
+                    "status": "failed",
+                    "started_at": mock.ANY,
+                    "completed_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_handler(capture_final_response)
 
@@ -762,6 +776,7 @@ def test_queue_worker_unhandled_error(
                             "input": {
                                 "text": "bar",
                             },
+                            "version": "abcde",
                             "webhook": webhook_url,
                         }
                     ),
@@ -778,24 +793,7 @@ def test_queue_worker_invalid_input(
     project_dir = Path(__file__).parent / "fixtures/int-project"
     subprocess.run(["cog", "build", "-t", docker_image], check=True, cwd=project_dir)
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "redis",
-            "6379",
-            "predict-queue",
-            "",
-            "test-worker",
-            "model_id",
-            "logs",
-        ],
-        env=DEFAULT_ENV,
-    ):
+    with model_running(docker_image, docker_network):
         predict_id = random_string(10)
         webhook_url = httpserver.url_for("/webhook").replace(
             "localhost", "host.docker.internal"
@@ -809,17 +807,19 @@ def test_queue_worker_invalid_input(
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "num": "not a number",
-                },
-                "webhook": webhook_url,
-                "error": mock.ANY,
-                "logs": "",
-                "output": None,
-                "status": "failed",
-            },
+            json=match(
+                {
+                    "error": mock.ANY,
+                    "id": predict_id,
+                    "input": {
+                        "num": "not a number",
+                    },
+                    "logs": "",
+                    "output": None,
+                    "status": "failed",
+                    "webhook": webhook_url,
+                }
+            ),
             method="POST",
         ).respond_with_handler(capture_final_response)
 
@@ -837,6 +837,7 @@ def test_queue_worker_invalid_input(
                             "input": {
                                 "num": "not a number",
                             },
+                            "version": "abcde",
                             "webhook": webhook_url,
                         }
                     ),
@@ -853,24 +854,7 @@ def test_queue_worker_logging(docker_network, docker_image, redis_client, httpse
     project_dir = Path(__file__).parent / "fixtures/logging-project"
     subprocess.run(["cog", "build", "-t", docker_image], check=True, cwd=project_dir)
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "redis",
-            "6379",
-            "predict-queue",
-            "",
-            "test-worker",
-            "model_id",
-            "logs",
-        ],
-        env=DEFAULT_ENV,
-    ):
+    with model_running(docker_image, docker_network):
         predict_id = random_string(10)
         webhook_url = httpserver.url_for("/webhook").replace(
             "localhost", "host.docker.internal"
@@ -878,103 +862,115 @@ def test_queue_worker_logging(docker_network, docker_image, redis_client, httpse
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {},
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {},
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {},
-                "webhook": webhook_url,
-                "logs": "WARNING:root:writing log message\n",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {},
+                    "logs": "WARNING:root:writing log message\n",
+                    "output": None,
+                    "started_at": mock.ANY,
+                    "status": "processing",
+                    "webhook": webhook_url,
+                }
+            ),
             method="POST",
         )
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {},
-                "webhook": webhook_url,
-                "logs": "WARNING:root:writing log message\nwriting from C\n",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {},
+                    "webhook": webhook_url,
+                    "logs": "WARNING:root:writing log message\nwriting from C\n",
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {},
-                "webhook": webhook_url,
-                "logs": (
-                    "WARNING:root:writing log message\n"
-                    + "writing from C\n"
-                    + "writing to stderr\n"
-                ),
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {},
+                    "webhook": webhook_url,
+                    "logs": (
+                        "WARNING:root:writing log message\n"
+                        + "writing from C\n"
+                        + "writing to stderr\n"
+                    ),
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {},
-                "webhook": webhook_url,
-                "logs": (
-                    "WARNING:root:writing log message\n"
-                    + "writing from C\n"
-                    + "writing to stderr\n"
-                    + "writing with print\n"
-                ),
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {},
+                    "webhook": webhook_url,
+                    "logs": (
+                        "WARNING:root:writing log message\n"
+                        + "writing from C\n"
+                        + "writing to stderr\n"
+                        + "writing with print\n"
+                    ),
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {},
-                "webhook": webhook_url,
-                "logs": (
-                    "WARNING:root:writing log message\n"
-                    + "writing from C\n"
-                    + "writing to stderr\n"
-                    + "writing with print\n"
-                ),
-                "output": "output",
-                "status": "succeeded",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-                "metrics": {
-                    "predict_time": mock.ANY,
-                },
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {},
+                    "webhook": webhook_url,
+                    "logs": (
+                        "WARNING:root:writing log message\n"
+                        + "writing from C\n"
+                        + "writing to stderr\n"
+                        + "writing with print\n"
+                    ),
+                    "output": "output",
+                    "status": "succeeded",
+                    "started_at": mock.ANY,
+                    "completed_at": mock.ANY,
+                    "metrics": {
+                        "predict_time": mock.ANY,
+                    },
+                }
+            ),
             method="POST",
         )
 
@@ -990,6 +986,7 @@ def test_queue_worker_logging(docker_network, docker_image, redis_client, httpse
                         {
                             "id": predict_id,
                             "input": {},
+                            "version": "abcde",
                             "webhook": webhook_url,
                         }
                     ),
@@ -1004,23 +1001,7 @@ def test_queue_worker_timeout(docker_network, docker_image, redis_client, httpse
     project_dir = Path(__file__).parent / "fixtures/timeout-project"
     subprocess.run(["cog", "build", "-t", docker_image], check=True, cwd=project_dir)
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "--redis-url=redis://redis:6379/0",
-            "--input-queue=predict-queue",
-            "--upload-url=",
-            "--consumer-id=test-worker",
-            "--model-id=model_id",
-            "--predict-timeout=2",
-        ],
-        env=DEFAULT_ENV,
-    ):
+    with model_running(docker_image, docker_network, predict_timeout=2):
         predict_id = random_string(10)
         webhook_url = httpserver.url_for("/webhook").replace(
             "localhost", "host.docker.internal"
@@ -1028,37 +1009,41 @@ def test_queue_worker_timeout(docker_network, docker_image, redis_client, httpse
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "sleep_time": 0.1,
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "sleep_time": 0.1,
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_data("OK")
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "sleep_time": 0.1,
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": "it worked after 0.1 seconds!",
-                "status": "succeeded",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-                "metrics": {
-                    "predict_time": mock.ANY,
-                },
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "sleep_time": 0.1,
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": "it worked after 0.1 seconds!",
+                    "status": "succeeded",
+                    "started_at": mock.ANY,
+                    "completed_at": mock.ANY,
+                    "metrics": {
+                        "predict_time": mock.ANY,
+                    },
+                }
+            ),
             method="POST",
         ).respond_with_data("OK")
 
@@ -1076,6 +1061,7 @@ def test_queue_worker_timeout(docker_network, docker_image, redis_client, httpse
                             "input": {
                                 "sleep_time": 0.1,
                             },
+                            "version": "abcde",
                             "webhook": webhook_url,
                         }
                     ),
@@ -1089,35 +1075,39 @@ def test_queue_worker_timeout(docker_network, docker_image, redis_client, httpse
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "sleep_time": 3.0,
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "sleep_time": 3.0,
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_data("OK")
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "sleep_time": 3.0,
-                },
-                "webhook": webhook_url,
-                "error": "Prediction timed out",
-                "logs": "",
-                "output": None,
-                "status": "failed",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "sleep_time": 3.0,
+                    },
+                    "webhook": webhook_url,
+                    "error": "Prediction timed out",
+                    "logs": "",
+                    "output": None,
+                    "status": "failed",
+                    "started_at": mock.ANY,
+                    "completed_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_data("OK")
 
@@ -1131,6 +1121,7 @@ def test_queue_worker_timeout(docker_network, docker_image, redis_client, httpse
                             "input": {
                                 "sleep_time": 3.0,
                             },
+                            "version": "abcde",
                             "webhook": webhook_url,
                         }
                     ),
@@ -1144,37 +1135,41 @@ def test_queue_worker_timeout(docker_network, docker_image, redis_client, httpse
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "sleep_time": 0.2,
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "sleep_time": 0.2,
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_data("OK")
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "sleep_time": 0.2,
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": "it worked after 0.2 seconds!",
-                "status": "succeeded",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-                "metrics": {
-                    "predict_time": mock.ANY,
-                },
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "sleep_time": 0.2,
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": "it worked after 0.2 seconds!",
+                    "status": "succeeded",
+                    "started_at": mock.ANY,
+                    "completed_at": mock.ANY,
+                    "metrics": {
+                        "predict_time": mock.ANY,
+                    },
+                }
+            ),
             method="POST",
         ).respond_with_data("OK")
 
@@ -1188,6 +1183,7 @@ def test_queue_worker_timeout(docker_network, docker_image, redis_client, httpse
                             "input": {
                                 "sleep_time": 0.2,
                             },
+                            "version": "abcde",
                             "webhook": webhook_url,
                         }
                     ),
@@ -1204,25 +1200,7 @@ def test_queue_worker_yielding_timeout(
     project_dir = Path(__file__).parent / "fixtures/yielding-timeout-project"
     subprocess.run(["cog", "build", "-t", docker_image], check=True, cwd=project_dir)
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "redis",
-            "6379",
-            "predict-queue",
-            "",
-            "test-worker",
-            "model_id",
-            "logs",
-            "2",  # timeout
-        ],
-        env=DEFAULT_ENV,
-    ):
+    with model_running(docker_image, docker_network, predict_timeout=2):
         predict_id = random_string(10)
         webhook_url = httpserver.url_for("/webhook").replace(
             "localhost", "host.docker.internal"
@@ -1230,56 +1208,62 @@ def test_queue_worker_yielding_timeout(
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "sleep_time": 0.1,
-                    "n_iterations": 1,
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "sleep_time": 0.1,
+                        "n_iterations": 1,
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_data("OK")
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "sleep_time": 0.1,
-                    "n_iterations": 1,
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": ["yield 0"],
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "sleep_time": 0.1,
+                        "n_iterations": 1,
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": ["yield 0"],
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_data("OK")
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "sleep_time": 0.1,
-                    "n_iterations": 1,
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": ["yield 0"],
-                "status": "succeeded",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-                "metrics": {
-                    "predict_time": mock.ANY,
-                },
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "sleep_time": 0.1,
+                        "n_iterations": 1,
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": ["yield 0"],
+                    "status": "succeeded",
+                    "started_at": mock.ANY,
+                    "completed_at": mock.ANY,
+                    "metrics": {
+                        "predict_time": mock.ANY,
+                    },
+                }
+            ),
             method="POST",
         ).respond_with_data("OK")
 
@@ -1298,6 +1282,7 @@ def test_queue_worker_yielding_timeout(
                                 "sleep_time": 0.1,
                                 "n_iterations": 1,
                             },
+                            "version": "abcde",
                             "webhook": webhook_url,
                         }
                     ),
@@ -1311,71 +1296,79 @@ def test_queue_worker_yielding_timeout(
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "sleep_time": 0.8,
-                    "n_iterations": 10,
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "sleep_time": 0.8,
+                        "n_iterations": 10,
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_data("OK")
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "sleep_time": 0.8,
-                    "n_iterations": 10,
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": ["yield 0"],
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "sleep_time": 0.8,
+                        "n_iterations": 10,
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": ["yield 0"],
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_data("OK")
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "sleep_time": 0.8,
-                    "n_iterations": 10,
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": ["yield 0", "yield 1"],
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "sleep_time": 0.8,
+                        "n_iterations": 10,
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": ["yield 0", "yield 1"],
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_data("OK")
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "sleep_time": 0.8,
-                    "n_iterations": 10,
-                },
-                "webhook": webhook_url,
-                "error": "Prediction timed out",
-                "logs": "",
-                "output": ["yield 0", "yield 1"],
-                "status": "failed",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "sleep_time": 0.8,
+                        "n_iterations": 10,
+                    },
+                    "webhook": webhook_url,
+                    "error": "Prediction timed out",
+                    "logs": "",
+                    "output": ["yield 0", "yield 1"],
+                    "status": "failed",
+                    "started_at": mock.ANY,
+                    "completed_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_data("OK")
 
@@ -1390,6 +1383,7 @@ def test_queue_worker_yielding_timeout(
                                 "sleep_time": 0.8,
                                 "n_iterations": 10,
                             },
+                            "version": "abcde",
                             "webhook": webhook_url,
                         }
                     ),
@@ -1406,24 +1400,7 @@ def test_queue_worker_complex_output(
     project_dir = Path(__file__).parent / "fixtures/complex-output-project"
     subprocess.run(["cog", "build", "-t", docker_image], check=True, cwd=project_dir)
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "redis",
-            "6379",
-            "predict-queue",
-            "",
-            "test-worker",
-            "model_id",
-            "logs",
-        ],
-        env=DEFAULT_ENV,
-    ):
+    with model_running(docker_image, docker_network):
         predict_id = random_string(10)
         webhook_url = httpserver.url_for("/webhook").replace(
             "localhost", "host.docker.internal"
@@ -1431,40 +1408,44 @@ def test_queue_worker_complex_output(
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "name": "world",
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "name": "world",
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "name": "world",
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": {
-                    "hello": "hello world",
-                    "goodbye": "goodbye world",
-                },
-                "status": "succeeded",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-                "metrics": {
-                    "predict_time": mock.ANY,
-                },
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "name": "world",
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": {
+                        "hello": "hello world",
+                        "goodbye": "goodbye world",
+                    },
+                    "status": "succeeded",
+                    "started_at": mock.ANY,
+                    "completed_at": mock.ANY,
+                    "metrics": {
+                        "predict_time": mock.ANY,
+                    },
+                }
+            ),
             method="POST",
         )
 
@@ -1482,6 +1463,7 @@ def test_queue_worker_complex_output(
                             "input": {
                                 "name": "world",
                             },
+                            "version": "abcde",
                             "webhook": webhook_url,
                         }
                     ),
@@ -1504,24 +1486,7 @@ def test_queue_worker_yielding_list_of_complex_output(
     )
     subprocess.run(["cog", "build", "-t", docker_image], check=True, cwd=project_dir)
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "redis",
-            "6379",
-            "predict-queue",
-            "http://upload-server:5000/upload",
-            "test-worker",
-            "model_id",
-            "logs",
-        ],
-        env=DEFAULT_ENV,
-    ):
+    with model_running(docker_image, docker_network):
         predict_id = random_string(10)
         webhook_url = httpserver.url_for("/webhook").replace(
             "localhost", "host.docker.internal"
@@ -1529,61 +1494,67 @@ def test_queue_worker_yielding_list_of_complex_output(
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {},
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {},
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {},
-                "webhook": webhook_url,
-                "logs": "",
-                "output": [
-                    [
-                        {
-                            "file": "http://upload-server:5000/files/file",
-                            "text": "hello",
-                        }
-                    ]
-                ],
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {},
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": [
+                        [
+                            {
+                                "file": "http://upload-server:5000/files/file",
+                                "text": "hello",
+                            }
+                        ]
+                    ],
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         )
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {},
-                "webhook": webhook_url,
-                "logs": "",
-                "output": [
-                    [
-                        {
-                            "file": "http://upload-server:5000/files/file",
-                            "text": "hello",
-                        }
-                    ]
-                ],
-                "status": "succeeded",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-                "metrics": {
-                    "predict_time": mock.ANY,
-                },
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {},
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": [
+                        [
+                            {
+                                "file": "http://upload-server:5000/files/file",
+                                "text": "hello",
+                            }
+                        ]
+                    ],
+                    "status": "succeeded",
+                    "started_at": mock.ANY,
+                    "completed_at": mock.ANY,
+                    "metrics": {
+                        "predict_time": mock.ANY,
+                    },
+                }
+            ),
             method="POST",
         )
 
@@ -1599,6 +1570,7 @@ def test_queue_worker_yielding_list_of_complex_output(
                         {
                             "id": predict_id,
                             "input": {},
+                            "version": "abcde",
                             "webhook": webhook_url,
                         }
                     ),
@@ -1617,24 +1589,7 @@ def test_queue_worker_setup(docker_network, docker_image, redis_client, httpserv
     project_dir = Path(__file__).parent / "fixtures/long-setup-project"
     subprocess.run(["cog", "build", "-t", docker_image], check=True, cwd=project_dir)
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "redis",
-            "6379",
-            "predict-queue",
-            "",
-            "test-worker",
-            "model_id",
-            "logs",
-        ],
-        env=DEFAULT_ENV,
-    ):
+    with model_running(docker_image, docker_network):
         httpserver.expect_request("/webhook", method="POST")
         redis_client.xgroup_create(
             mkstream=True, groupname="predict-queue", name="predict-queue", id="$"
@@ -1651,6 +1606,7 @@ def test_queue_worker_setup(docker_network, docker_image, redis_client, httpserv
                     {
                         "id": predict_id,
                         "input": {},
+                        "version": "abcde",
                         "webhook": webhook_url,
                     }
                 ),
@@ -1665,6 +1621,7 @@ def test_queue_worker_setup(docker_network, docker_image, redis_client, httpserv
                     {
                         "id": predict_id,
                         "input": {},
+                        "version": "abcde",
                         "webhook": webhook_url,
                     }
                 ),
@@ -1679,6 +1636,7 @@ def test_queue_worker_setup(docker_network, docker_image, redis_client, httpserv
                     {
                         "id": predict_id,
                         "input": {},
+                        "version": "abcde",
                         "webhook": webhook_url,
                     }
                 ),
@@ -1706,24 +1664,7 @@ def test_queue_worker_webhook_retries(
     project_dir = Path(__file__).parent / "fixtures/int-project"
     subprocess.run(["cog", "build", "-t", docker_image], check=True, cwd=project_dir)
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "redis",
-            "6379",
-            "predict-queue",
-            "",
-            "test-worker",
-            "model_id",
-            "logs",
-        ],
-        env=DEFAULT_ENV,
-    ):
+    with model_running(docker_image, docker_network):
         predict_id = random_string(10)
         webhook_url = httpserver.url_for("/webhook").replace(
             "localhost", "host.docker.internal"
@@ -1732,46 +1673,27 @@ def test_queue_worker_webhook_retries(
         # respond with an error to the initial response -- it shouldn't be retried
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "num": 8,
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "num": 8,
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                }
+            ),
             method="POST",
         ).respond_with_data("error", status=500)
 
         # respond with an error to the terminal response ...
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "num": 8,
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": 16,
-                "status": "succeeded",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-                "metrics": {
-                    "predict_time": mock.ANY,
-                },
-            },
-            method="POST",
-        ).respond_with_data("error", status=500)
-
-        # ... it should be retried several times
-        for x in range(3):
-            httpserver.expect_oneshot_request(
-                "/webhook",
-                json={
+            json=match(
+                {
                     "id": predict_id,
                     "input": {
                         "num": 8,
@@ -1785,7 +1707,32 @@ def test_queue_worker_webhook_retries(
                     "metrics": {
                         "predict_time": mock.ANY,
                     },
-                },
+                }
+            ),
+            method="POST",
+        ).respond_with_data("error", status=500)
+
+        # ... it should be retried several times
+        for x in range(3):
+            httpserver.expect_oneshot_request(
+                "/webhook",
+                json=match(
+                    {
+                        "id": predict_id,
+                        "input": {
+                            "num": 8,
+                        },
+                        "webhook": webhook_url,
+                        "logs": "",
+                        "output": 16,
+                        "status": "succeeded",
+                        "started_at": mock.ANY,
+                        "completed_at": mock.ANY,
+                        "metrics": {
+                            "predict_time": mock.ANY,
+                        },
+                    }
+                ),
                 method="POST",
             )
 
@@ -1803,6 +1750,7 @@ def test_queue_worker_webhook_retries(
                             "input": {
                                 "num": 8,
                             },
+                            "version": "abcde",
                             "webhook": webhook_url,
                         }
                     ),
@@ -1813,95 +1761,11 @@ def test_queue_worker_webhook_retries(
         assert waiting.result
 
 
-def test_queue_worker_redis_responses(docker_network, docker_image, redis_client):
-    project_dir = Path(__file__).parent / "fixtures/int-project"
-    subprocess.run(["cog", "build", "-t", docker_image], check=True, cwd=project_dir)
-
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "redis",
-            "6379",
-            "predict-queue",
-            "",
-            "test-worker",
-            "model_id",
-            "logs",
-        ],
-        env=DEFAULT_ENV,
-    ):
-        redis_client.xgroup_create(
-            mkstream=True, groupname="predict-queue", name="predict-queue", id="$"
-        )
-
-        predict_id = random_string(10)
-        redis_client.xadd(
-            name="predict-queue",
-            fields={
-                "value": json.dumps(
-                    {
-                        "id": predict_id,
-                        "input": {
-                            "num": 42,
-                        },
-                        "response_queue": "response-queue",
-                    }
-                ),
-            },
-        )
-
-        responses = response_iterator(redis_client, "response-queue")
-
-        # Discard the initial response -- depending on the speed of the test
-        # runner, the second response can come before we've had a chance to
-        # read it. This asserts a response happened, but not what it contains.
-        response = next(responses)
-
-        response = next(responses)
-        assert response == {
-            "id": predict_id,
-            "input": {
-                "num": 42,
-            },
-            "response_queue": "response-queue",
-            "logs": "",
-            "output": 84,
-            "status": "succeeded",
-            "started_at": mock.ANY,
-            "completed_at": mock.ANY,
-            "metrics": {
-                "predict_time": mock.ANY,
-            },
-        }
-
-
 def test_queue_worker_cancel(docker_network, docker_image, redis_client, httpserver):
     project_dir = Path(__file__).parent / "fixtures/timeout-project"
     subprocess.run(["cog", "build", "-t", docker_image], check=True, cwd=project_dir)
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "redis",
-            "6379",
-            "predict-queue",
-            "",
-            "test-worker",
-            "model_id",
-            "logs",
-        ],
-        env=DEFAULT_ENV,
-    ):
+    with model_running(docker_image, docker_network):
         predict_id = random_string(10)
         webhook_url = httpserver.url_for("/webhook").replace(
             "localhost", "host.docker.internal"
@@ -1909,18 +1773,20 @@ def test_queue_worker_cancel(docker_network, docker_image, redis_client, httpser
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "sleep_time": 30,
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "processing",
-                "started_at": mock.ANY,
-                "cancel_key": "cancel-key",
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "sleep_time": 30,
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": None,
+                    "status": "processing",
+                    "started_at": mock.ANY,
+                    "cancel_key": "cancel-key",
+                }
+            ),
             method="POST",
         )
 
@@ -1938,6 +1804,7 @@ def test_queue_worker_cancel(docker_network, docker_image, redis_client, httpser
                             "input": {
                                 "sleep_time": 30,
                             },
+                            "version": "abcde",
                             "webhook": webhook_url,
                             "cancel_key": "cancel-key",
                         }
@@ -1950,19 +1817,21 @@ def test_queue_worker_cancel(docker_network, docker_image, redis_client, httpser
 
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {
-                    "sleep_time": 30,
-                },
-                "webhook": webhook_url,
-                "logs": "",
-                "output": None,
-                "status": "canceled",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-                "cancel_key": "cancel-key",
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {
+                        "sleep_time": 30,
+                    },
+                    "webhook": webhook_url,
+                    "logs": "",
+                    "output": None,
+                    "status": "canceled",
+                    "started_at": mock.ANY,
+                    "completed_at": mock.ANY,
+                    "cancel_key": "cancel-key",
+                }
+            ),
             method="POST",
         )
 
@@ -1981,12 +1850,14 @@ def test_queue_worker_report_setup_run_success(
 
     httpserver.expect_oneshot_request(
         "/report-setup-run",
-        json={
-            "status": "succeeded",
-            "started_at": mock.ANY,
-            "completed_at": mock.ANY,
-            "logs": "",
-        },
+        json=match(
+            {
+                "status": "succeeded",
+                "started_at": mock.ANY,
+                "completed_at": mock.ANY,
+                "logs": "",
+            }
+        ),
         method="POST",
     )
 
@@ -1994,20 +1865,8 @@ def test_queue_worker_report_setup_run_success(
         "localhost", "host.docker.internal"
     )
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "--input-queue=predict-queue",
-            "--redis-host=redis",
-            "--redis-port=6379",
-            f"--report-setup-run-url={report_setup_run_url}",
-        ],
-        env=DEFAULT_ENV,
+    with model_running(
+        docker_image, docker_network, report_setup_run_url=report_setup_run_url
     ):
         with httpserver.wait(timeout=15) as waiting:
             pass
@@ -2043,19 +1902,8 @@ def test_queue_worker_report_setup_run_failure(
         "localhost", "host.docker.internal"
     )
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "--input-queue=predict-queue",
-            "--redis-url=redis://redis:6379/0",
-            f"--report-setup-run-url={report_setup_run_url}",
-        ],
-        env=DEFAULT_ENV,
+    with model_running(
+        docker_image, docker_network, report_setup_run_url=report_setup_run_url
     ):
         with httpserver.wait(timeout=15) as waiting:
             pass
@@ -2087,20 +1935,7 @@ def test_queue_worker_webhook_events_filter(
     project_dir = Path(__file__).parent / "fixtures/logging-project"
     subprocess.run(["cog", "build", "-t", docker_image], check=True, cwd=project_dir)
 
-    with docker_run(
-        image=docker_image,
-        interactive=True,
-        network=docker_network,
-        command=[
-            "python",
-            "-m",
-            "cog.server.redis_queue",
-            "--redis-url=redis://redis:6379/0",
-            "--input-queue=predict-queue",
-            "--consumer-id=test-worker",
-        ],
-        env=DEFAULT_ENV,
-    ):
+    with model_running(docker_image, docker_network):
         predict_id = random_string(10)
         webhook_url = httpserver.url_for("/webhook").replace(
             "localhost", "host.docker.internal"
@@ -2109,25 +1944,27 @@ def test_queue_worker_webhook_events_filter(
         # We're only expecting a single webhook: after the prediction is done
         httpserver.expect_oneshot_request(
             "/webhook",
-            json={
-                "id": predict_id,
-                "input": {},
-                "webhook": webhook_url,
-                "webhook_events_filter": ["completed"],
-                "logs": (
-                    "WARNING:root:writing log message\n"
-                    + "writing from C\n"
-                    + "writing to stderr\n"
-                    + "writing with print\n"
-                ),
-                "output": "output",
-                "status": "succeeded",
-                "started_at": mock.ANY,
-                "completed_at": mock.ANY,
-                "metrics": {
-                    "predict_time": mock.ANY,
-                },
-            },
+            json=match(
+                {
+                    "id": predict_id,
+                    "input": {},
+                    "webhook": webhook_url,
+                    "webhook_events_filter": ["completed"],
+                    "logs": (
+                        "WARNING:root:writing log message\n"
+                        + "writing from C\n"
+                        + "writing to stderr\n"
+                        + "writing with print\n"
+                    ),
+                    "output": "output",
+                    "status": "succeeded",
+                    "started_at": mock.ANY,
+                    "completed_at": mock.ANY,
+                    "metrics": {
+                        "predict_time": mock.ANY,
+                    },
+                }
+            ),
             method="POST",
         )
 
@@ -2143,6 +1980,7 @@ def test_queue_worker_webhook_events_filter(
                         {
                             "id": predict_id,
                             "input": {},
+                            "version": "abcde",
                             "webhook": webhook_url,
                             "webhook_events_filter": ["completed"],
                         }

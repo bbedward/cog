@@ -1,15 +1,19 @@
+from datetime import datetime
 import base64
 import io
+import responses
+from responses import matchers
+import time
 
 from PIL import Image
 import pytest
 import unittest.mock as mock
 
-from .conftest import make_client, match, uses_predictor
+from .conftest import make_client, uses_predictor
 
 
 @uses_predictor("setup")
-def test_setup_is_called(client):
+def test_setup_is_called(client, match):
     resp = client.post("/predictions")
     assert resp.status_code == 200
     assert resp.json() == match({"status": "succeeded", "output": "bar"})
@@ -23,55 +27,92 @@ def test_openapi_specification(client):
     schema = resp.json()
     assert schema["openapi"] == "3.0.2"
     assert schema["info"] == {"title": "Cog", "version": "0.1.0"}
-    assert schema["paths"] == {
-        "/": {
-            "get": {
-                "summary": "Root",
-                "operationId": "root__get",
-                "responses": {
-                    "200": {
-                        "description": "Successful Response",
-                        "content": {"application/json": {"schema": mock.ANY}},
+    assert schema["paths"]["/"] == {
+        "get": {
+            "summary": "Root",
+            "operationId": "root__get",
+            "responses": {
+                "200": {
+                    "description": "Successful Response",
+                    "content": {"application/json": {"schema": mock.ANY}},
+                }
+            },
+        }
+    }
+    assert schema["paths"]["/predictions"] == {
+        "post": {
+            "summary": "Predict",
+            "description": "Run a single prediction on the model",
+            "operationId": "predict_predictions_post",
+            "parameters": [
+                {
+                    "in": "header",
+                    "name": "prefer",
+                    "required": False,
+                    "schema": {"title": "Prefer", "type": "string"},
+                }
+            ],
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/PredictionRequest"}
                     }
-                },
-            }
-        },
-        "/predictions": {
-            "post": {
-                "summary": "Predict",
-                "description": "Run a single prediction on the model",
-                "operationId": "predict_predictions_post",
-                "requestBody": {
+                }
+            },
+            "responses": {
+                "200": {
+                    "description": "Successful Response",
                     "content": {
                         "application/json": {
-                            "schema": {"$ref": "#/components/schemas/PredictionRequest"}
+                            "schema": {
+                                "$ref": "#/components/schemas/PredictionResponse"
+                            }
                         }
-                    }
-                },
-                "responses": {
-                    "200": {
-                        "description": "Successful Response",
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "$ref": "#/components/schemas/PredictionResponse"
-                                }
-                            }
-                        },
-                    },
-                    "422": {
-                        "description": "Validation Error",
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "$ref": "#/components/schemas/HTTPValidationError"
-                                }
-                            }
-                        },
                     },
                 },
-            }
-        },
+                "422": {
+                    "description": "Validation Error",
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/HTTPValidationError"
+                            }
+                        }
+                    },
+                },
+            },
+        }
+    }
+    assert schema["paths"]["/predictions/{prediction_id}/cancel"] == {
+        "post": {
+            "summary": "Cancel",
+            "description": "Cancel a running prediction",
+            "operationId": "cancel_predictions__prediction_id__cancel_post",
+            "parameters": [
+                {
+                    "in": "path",
+                    "name": "prediction_id",
+                    "required": True,
+                    "schema": {"title": "Prediction ID", "type": "string"},
+                }
+            ],
+            "responses": {
+                "200": {
+                    "content": {"application/json": {"schema": mock.ANY}},
+                    "description": "Successful Response",
+                },
+                "422": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/HTTPValidationError"
+                            }
+                        }
+                    },
+                    "description": "Validation Error",
+                },
+            },
+        }
     }
     assert schema["components"]["schemas"]["Input"] == {
         "title": "Input",
@@ -242,7 +283,7 @@ def test_openapi_specification_with_int_choices(client):
 
 
 @uses_predictor("yield_strings")
-def test_yielding_strings_from_generator_predictors(client):
+def test_yielding_strings_from_generator_predictors(client, match):
     resp = client.post("/predictions")
     assert resp.status_code == 200
     assert resp.json() == match(
@@ -251,7 +292,7 @@ def test_yielding_strings_from_generator_predictors(client):
 
 
 @uses_predictor("yield_strings_file_input")
-def test_yielding_strings_from_generator_predictors_file_input(client):
+def test_yielding_strings_from_generator_predictors_file_input(client, match):
     resp = client.post(
         "/predictions",
         json={"input": {"file": "data:text/plain; charset=utf-8;base64,aGVsbG8="}},
@@ -280,3 +321,136 @@ def test_yielding_files_from_generator_predictors(client):
     assert image_color(output[0]) == (255, 0, 0)  # red
     assert image_color(output[1]) == (0, 0, 255)  # blue
     assert image_color(output[2]) == (255, 255, 0)  # yellow
+
+
+@uses_predictor("input_none")
+def test_prediction_idempotent_endpoint(client, match):
+    resp = client.put("/predictions/abcd1234", json={})
+    assert resp.status_code == 200
+    assert resp.json() == match(
+        {"id": "abcd1234", "status": "succeeded", "output": "foobar"}
+    )
+
+
+@uses_predictor("input_none")
+def test_prediction_idempotent_endpoint_matched_ids(client, match):
+    resp = client.put(
+        "/predictions/abcd1234",
+        json={
+            "id": "abcd1234",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == match(
+        {"id": "abcd1234", "status": "succeeded", "output": "foobar"}
+    )
+
+
+@uses_predictor("input_none")
+def test_prediction_idempotent_endpoint_mismatched_ids(client, match):
+    resp = client.put(
+        "/predictions/abcd1234",
+        json={
+            "id": "foobar",
+        },
+    )
+    assert resp.status_code == 422
+
+
+@uses_predictor("sleep")
+def test_prediction_idempotent_endpoint_is_idempotent(client, match):
+    resp1 = client.put(
+        "/predictions/abcd1234",
+        json={"input": {"sleep": 1}},
+        headers={"Prefer": "respond-async"},
+    )
+    resp2 = client.put(
+        "/predictions/abcd1234",
+        json={"input": {"sleep": 1}},
+        headers={"Prefer": "respond-async"},
+    )
+    assert resp1.status_code == 202
+    assert resp1.json() == match({"id": "abcd1234", "status": "processing"})
+    assert resp2.status_code == 202
+    assert resp2.json() == match({"id": "abcd1234", "status": "processing"})
+
+
+@uses_predictor("sleep")
+def test_prediction_idempotent_endpoint_conflict(client, match):
+    resp1 = client.put(
+        "/predictions/abcd1234",
+        json={"input": {"sleep": 1}},
+        headers={"Prefer": "respond-async"},
+    )
+    resp2 = client.put(
+        "/predictions/5678efgh",
+        json={"input": {"sleep": 1}},
+        headers={"Prefer": "respond-async"},
+    )
+    assert resp1.status_code == 202
+    assert resp1.json() == match({"id": "abcd1234", "status": "processing"})
+    assert resp2.status_code == 409
+
+
+# a basic end-to-end test for async predictions. if you're adding more
+# exhaustive tests of webhooks, consider adding them to test_runner.py
+@responses.activate
+@uses_predictor("input_string")
+def test_asynchronous_prediction_endpoint(client, match):
+    webhook = responses.post(
+        "https://example.com/webhook",
+        match=[
+            matchers.json_params_matcher(
+                {
+                    "id": "12345abcde",
+                    "status": "succeeded",
+                    "output": "hello world",
+                },
+                strict_match=False,
+            )
+        ],
+        status=200,
+    )
+
+    resp = client.post(
+        "/predictions",
+        json={
+            "id": "12345abcde",
+            "input": {"text": "hello world"},
+            "webhook": "https://example.com/webhook",
+            "webhook_events_filter": ["completed"],
+        },
+        headers={"Prefer": "respond-async"},
+    )
+    assert resp.status_code == 202
+
+    assert resp.json() == match(
+        {"status": "processing", "output": None, "started_at": mock.ANY}
+    )
+    assert resp.json()["started_at"] is not None
+
+    n = 0
+    while webhook.call_count < 1 and n < 10:
+        time.sleep(0.1)
+        n += 1
+
+    assert webhook.call_count == 1
+
+
+@uses_predictor("sleep")
+def test_prediction_cancel(client):
+    resp = client.post("/predictions/123/cancel")
+    assert resp.status_code == 404
+
+    resp = client.post(
+        "/predictions",
+        json={"id": "123", "input": {"sleep": 1}},
+        headers={"Prefer": "respond-async"},
+    )
+    assert resp.status_code == 202
+
+    resp = client.post("/predictions/456/cancel")
+    assert resp.status_code == 404
+
+    resp = client.post("/predictions/123/cancel")
+    assert resp.status_code == 200

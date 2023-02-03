@@ -1,18 +1,19 @@
+import typing as t
 from datetime import datetime
 from enum import Enum
-import typing as t
 
 import pydantic
 
 
 class Status(str, Enum):
+    STARTING = "starting"
     PROCESSING = "processing"
     SUCCEEDED = "succeeded"
     CANCELED = "canceled"
     FAILED = "failed"
 
     @staticmethod
-    def is_terminal(status: "Status") -> bool:
+    def is_terminal(status: t.Optional["Status"]) -> bool:
         return status in {Status.SUCCEEDED, Status.CANCELED, Status.FAILED}
 
 
@@ -62,9 +63,11 @@ class PredictionResponse(PredictionBaseModel):
     started_at: t.Optional[datetime]
     completed_at: t.Optional[datetime]
 
-    logs: t.Optional[str]
+    logs: str = ""
     error: t.Optional[str]
     status: t.Optional[Status]
+
+    metrics: t.Optional[t.Dict[str, t.Any]]
 
     @classmethod
     def with_types(cls, input_type: t.Type, output_type: t.Type) -> t.Any:
