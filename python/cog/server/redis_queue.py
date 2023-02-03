@@ -338,7 +338,7 @@ class RedisQueueWorker:
 
                     try:
                         output = self.upload_files(
-                            event.payload, input_obj.dict()["user_id"]
+                            event.payload, input_obj.dict()["upload_path"]
                         )
 
                         if output_type.multi:
@@ -412,16 +412,19 @@ class RedisQueueWorker:
 
         return checker
 
-    def upload_files(self, obj: Any, user_id: str) -> Any:
+    def upload_files(self, obj: Any, upload_path: str) -> Any:
         def upload_file(fh: io.IOBase) -> str:
             filename = guess_filename(fh)
+            _, extension = os.path.splitext(filename)
+            if extension == ".jpg":
+                extension = ".jpeg"
 
             self.s3_client.Bucket(self.s3_bucket).upload_fileobj(
-                fh, f"{user_id}/{filename}"
+                fh, f"{upload_path}.{extension}"
             )
 
-            #  URL will be bucket/<user_id>/<filename>
-            final_url = f"{self.s3_bucket}/{user_id}/{filename}"
+            #  URL will be bucket/path.extension
+            final_url = f"{self.s3_bucket}/{upload_path}.{extension}"
 
             return final_url
 
