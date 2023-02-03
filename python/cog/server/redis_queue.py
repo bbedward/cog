@@ -11,6 +11,8 @@ from mimetypes import guess_type
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 from urllib.parse import urlparse
 
+import boto3
+from boto3_type_annotations.s3 import ServiceResource
 import redis
 import requests
 from opentelemetry import trace
@@ -45,7 +47,8 @@ class RedisQueueWorker:
         predictor_ref: str,
         redis_url: str,
         input_queue: str,
-        upload_url: str,
+        s3_client: ServiceResource,
+        s3_bucket: str,
         consumer_id: str,
         predict_timeout: Optional[int] = None,
         report_setup_run_url: Optional[str] = None,
@@ -54,7 +57,8 @@ class RedisQueueWorker:
         self.worker = Worker(predictor_ref)
         self.redis_url = redis_url
         self.input_queue = input_queue
-        self.upload_url = upload_url
+        self.s3_client = s3_client
+        self.s3_bucket = s3_bucket
         self.consumer_id = consumer_id
         self.predict_timeout = predict_timeout
         self.report_setup_run_url = report_setup_run_url
@@ -331,9 +335,10 @@ class RedisQueueWorker:
                         output_type is not None
                     ), "Predictor returned unexpected output"
 
-
                     try:
-                        output = self.upload_files(event.payload)
+                        output = self.upload_files(
+                            event.payload, input_obj.dict()["user_id"]
+                        )
 
                         if output_type.multi:
                             response["output"].append(output)
@@ -405,21 +410,16 @@ class RedisQueueWorker:
 
         return checker
 
-    def upload_files(self, obj: Any) -> Any:
+    def upload_files(self, obj: Any, user_id: str) -> Any:
         def upload_file(fh: io.IOBase) -> str:
             filename = guess_filename(fh)
-            content_type, _ = guess_type(filename)
-            retries = 0
 
-            resp = requests.put(
-                ensure_trailing_slash(self.upload_url) + filename,
-                fh,  # type: ignore
-                headers={"Content-type": content_type} if content_type else None,
+            self.s3_client.Bucket(self.s3_bucket).upload_fileobj(
+                fh, f"{user_id}/{filename}"
             )
-            resp.raise_for_status()
 
-            # strip any signing gubbins from the URL
-            final_url = urlparse(resp.url)._replace(query="").geturl()
+            #  URL will be bucket/<user_id>/<filename>
+            final_url = f"{self.s3_bucket}/{user_id}/{filename}"
 
             return final_url
 
@@ -452,36 +452,6 @@ def ensure_trailing_slash(url: str) -> str:
         return url
     else:
         return url + "/"
-
-
-def _queue_worker_from_argv(
-    predictor_ref: str,
-    redis_host: str,
-    redis_port: str,
-    input_queue: str,
-    upload_url: str,
-    comsumer_id: str,
-    model_id: str,
-    log_queue: str,
-    predict_timeout: Optional[str] = None,
-) -> RedisQueueWorker:
-    """
-    Construct a RedisQueueWorker object from sys.argv, taking into account optional arguments and types.
-
-    This is intensely fragile. This should be kwargs or JSON or something like that.
-    """
-    if predict_timeout is not None:
-        predict_timeout_int = int(predict_timeout)
-    else:
-        predict_timeout_int = None
-    return RedisQueueWorker(
-        predictor_ref,
-        f"redis://{redis_host}:{redis_port}/0",
-        input_queue,
-        upload_url,
-        comsumer_id,
-        predict_timeout_int,
-    )
 
 
 def _die(signum: Any, frame: Any) -> None:
@@ -518,7 +488,10 @@ if __name__ == "__main__":
     parser.add_argument("--redis-port", type=int)
     parser.add_argument("--redis-url")
     parser.add_argument("--input-queue")
-    parser.add_argument("--upload-url")
+    parser.add_argument("--s3-access-key")
+    parser.add_argument("--s3-secret-key")
+    parser.add_argument("--s3-endpoint-url")
+    parser.add_argument("--s3-bucket")
     parser.add_argument("--consumer-id")
     parser.add_argument("--model-id")
     parser.add_argument("--predict-timeout", type=int)
@@ -535,18 +508,26 @@ if __name__ == "__main__":
         sys.stderr.write(
             "Positional arguments for queue worker are deprecated. Switch to flag arguments."
         )
-        worker = _queue_worker_from_argv(predictor_ref, *args.positional_args)
+        sys.exit(1)
     else:
         if args.redis_url is None:
             sys.stderr.write(
                 "--redis-host and --redis-port arguments are deprecated. Switch to --redis-url."
             )
             args.redis_url = f"redis://{args.redis_host}:{args.redis_port}/0"
+        # Configure boto3 client
+        s3: ServiceResource = boto3.resource(
+            "s3",
+            endpoint_url=args.s3_endpoint_url,
+            aws_access_key_id=args.s3_access_key,
+            aws_secret_access_key=args.s3_secret_key,
+        )
         worker = RedisQueueWorker(
             predictor_ref=predictor_ref,
             redis_url=args.redis_url,
             input_queue=args.input_queue,
-            upload_url=args.upload_url,
+            s3_client=s3,
+            s3_bucket=args.s3_bucket,
             consumer_id=args.consumer_id,
             predict_timeout=args.predict_timeout,
             report_setup_run_url=args.report_setup_run_url,
