@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 import boto3
 from boto3_type_annotations.s3 import ServiceResource
+from botocore.config import Config
 import redis
 import requests
 from opentelemetry import trace
@@ -521,6 +522,7 @@ if __name__ == "__main__":
             endpoint_url=args.s3_endpoint_url,
             aws_access_key_id=args.s3_access_key,
             aws_secret_access_key=args.s3_secret_key,
+            config=Config(retries={"max_attempts": 3, "mode": "standard"}),
         )
         worker = RedisQueueWorker(
             predictor_ref=predictor_ref,
