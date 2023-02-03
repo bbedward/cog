@@ -338,9 +338,10 @@ class RedisQueueWorker:
                     ), "Predictor returned unexpected output"
 
                     try:
-                        output = self.upload_files(
-                            event.payload, input_obj.dict()["upload_path_prefix"]
-                        )
+                        upload_prefix = ""
+                        if "upload_path_prefix" in input_obj.dict():
+                            upload_prefix = input_obj.dict()["upload_path_prefix"]
+                        output = self.upload_files(event.payload, upload_prefix)
 
                         if output_type.multi:
                             response["output"].append(output)
