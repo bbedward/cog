@@ -418,21 +418,31 @@ class RedisQueueWorker:
         def upload_file(fh: io.IOBase) -> str:
             filename = guess_filename(fh)
             _, extension = os.path.splitext(filename)
+            content_type = None
             if extension == ".jpg":
                 extension = ".jpeg"
+                content_type = "image/jpeg"
+            elif extension == ".png":
+                content_type = "image/png"
+            elif extension == ".webp":
+                content_type = "image/webp"
+
+            extra_args = {}
+            if content_type is not None:
+                extra_args["ContentType"] = content_type
 
             key = f"{str(uuid.uuid4())}{extension}"
             if upload_path_prefix is not None and upload_path_prefix != "":
                 key = f"{ensure_trailing_slash(upload_path_prefix)}{key}"
 
             start = time.time()
-            self.s3_client.Bucket(self.s3_bucket).upload_fileobj(fh, key)
+            self.s3_client.Bucket(self.s3_bucket).upload_fileobj(
+                fh, key, ExtraArgs=extra_args
+            )
             end = time.time()
             print(f"Uploaded to S3 - {key} - {round((end - start) *1000)} ms")
 
-            #  URL will be s3://bucket/path.extension
             final_url = f"s3://{self.s3_bucket}/{key}"
-
             return final_url
 
         return upload_files(obj, upload_file)
