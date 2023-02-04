@@ -430,7 +430,7 @@ class RedisQueueWorker:
             end = time.time()
             print(f"Uploaded to S3 - {key} - {round((end - start) *1000)} ms")
 
-            #  URL will be bucket/path.extension
+            #  URL will be s3://bucket/path.extension
             final_url = f"s3://{self.s3_bucket}/{key}"
 
             return final_url
