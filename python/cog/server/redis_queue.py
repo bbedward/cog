@@ -421,7 +421,7 @@ class RedisQueueWorker:
             if extension == ".jpg":
                 extension = ".jpeg"
 
-            key = f"{str(uuid.uuid4())}.{extension}"
+            key = f"{str(uuid.uuid4())}{extension}"
             if upload_path_prefix is not None and upload_path_prefix != "":
                 key = f"{ensure_trailing_slash(upload_path_prefix)}{key}"
 
