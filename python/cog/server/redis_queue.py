@@ -425,10 +425,13 @@ class RedisQueueWorker:
             if upload_path_prefix is not None and upload_path_prefix != "":
                 key = f"{ensure_trailing_slash(upload_path_prefix)}{key}"
 
+            start = time.time()
             self.s3_client.Bucket(self.s3_bucket).upload_fileobj(fh, key)
+            end = time.time()
+            print(f"Uploaded to S3 - {key} - {round((end - start) *1000)} ms")
 
             #  URL will be bucket/path.extension
-            final_url = f"{self.s3_bucket}/{key}"
+            final_url = f"s3://{self.s3_bucket}/{key}"
 
             return final_url
 
