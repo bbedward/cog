@@ -209,8 +209,8 @@ class RedisQueueWorker:
                     if webhook is not None:
                         send_response = webhook_caller(webhook)
                     else:
-                        redis_key = message["response_queue"]
-                        send_response = self.redis_setter(redis_key)
+                        redis_key = message["redis_pubsub_key"]
+                        send_response = self.redis_publisher(redis_key)
 
                     sys.stderr.write(
                         f"Received message {message_id} on {self.input_queue}\n"
@@ -396,9 +396,10 @@ class RedisQueueWorker:
         resp.raise_for_status()
         return resp.content
 
-    def redis_setter(self, redis_key: str) -> Callable:
+    # Publish to a redis channel
+    def redis_publisher(self, redis_key: str) -> Callable:
         def setter(response: Any) -> None:
-            self.redis.set(redis_key, json.dumps(response))
+            self.redis.publish(redis_key, json.dumps(response))
 
         return setter
 
