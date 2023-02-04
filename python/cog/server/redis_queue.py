@@ -418,9 +418,11 @@ class RedisQueueWorker:
         def upload_file(fh: io.IOBase) -> str:
             filename = guess_filename(fh)
             _, extension = os.path.splitext(filename)
-            content_type = None
             if extension == ".jpg":
                 extension = ".jpeg"
+
+            content_type = None
+            if extension == ".jpeg":
                 content_type = "image/jpeg"
             elif extension == ".png":
                 content_type = "image/png"
