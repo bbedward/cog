@@ -441,6 +441,10 @@ class RedisQueueWorker:
         )
         return f"s3://{self.s3_bucket}/{key}"
 
+    def upload_to_s3_from_file(self, obj: Any, upload_path_prefix: str) -> str:
+        with obj.open("rb") as f:
+            return self.upload_to_s3(f, upload_path_prefix)
+
     def upload_files(self, obj: Any, upload_path_prefix: str) -> Iterable[str]:
         # Params for thread pool
         params = []
@@ -458,7 +462,16 @@ class RedisQueueWorker:
         tasks: List[Future] = []
         with ThreadPoolExecutor(max_workers=len(params)) as executor:
             for p in params:
-                tasks.append(executor.submit(self.upload_to_s3, p, upload_path_prefix))
+                if isinstance(p, Path):
+                    tasks.append(
+                        executor.submit(
+                            self.upload_to_s3_from_file, p, upload_path_prefix
+                        )
+                    )
+                else:
+                    tasks.append(
+                        executor.submit(self.upload_to_s3, p, upload_path_prefix)
+                    )
 
         # Get results
         results = []
