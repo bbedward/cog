@@ -446,19 +446,19 @@ class RedisQueueWorker:
         params = []
         if isinstance(obj, dict):
             for key, value in obj.items():
-                params.append({"v": value, "arg": upload_path_prefix})
+                params.append(value)
         elif isinstance(obj, list):
             for value in obj:
-                params.append({"v": value, "arg": upload_path_prefix})
+                params.append(value)
         else:
-            params.append({"v": obj, "arg": upload_path_prefix})
+            params.append(obj)
 
         start = time.time()
         # Run all uploads at same time in threadpool
         tasks: List[Future] = []
         with ThreadPoolExecutor(max_workers=len(params)) as executor:
             for p in params:
-                tasks.append(executor.submit(self.upload_to_s3, p["v"], p["arg"]))
+                tasks.append(executor.submit(self.upload_to_s3, p, upload_path_prefix))
 
         # Get results
         results = []
