@@ -7,8 +7,9 @@ import sys
 import time
 import traceback
 from argparse import ArgumentParser
+from concurrent.futures import Future, ThreadPoolExecutor
 from mimetypes import guess_type
-from typing import Any, Callable, Dict, Iterable, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple, List
 from urllib.parse import urlparse
 
 import boto3
@@ -24,7 +25,6 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 from ..files import guess_filename
-from ..json import upload_files
 from ..predictor import (
     get_input_type,
     get_predictor_ref,
@@ -36,6 +36,7 @@ from .eventtypes import Done, Heartbeat, Log, PredictionOutput, PredictionOutput
 from .probes import ProbeHelper
 from .webhook import requests_session, webhook_caller
 from .worker import Worker
+from ..types import Path
 
 
 class RedisQueueWorker:
@@ -341,16 +342,9 @@ class RedisQueueWorker:
                         upload_prefix = ""
                         if "upload_path_prefix" in input_obj.dict():
                             upload_prefix = input_obj.dict()["upload_path_prefix"]
-                        output = self.upload_files(event.payload, upload_prefix)
-
-                        if output_type.multi:
-                            response["output"].append(output)
-                            yield (WebhookEvent.OUTPUT, response)
-                        else:
-                            assert (
-                                response["output"] is None
-                            ), "Predictor unexpectedly returned multiple outputs"
-                            response["output"] = output
+                        response["output"] = self.upload_files(
+                            event.payload, upload_prefix
+                        )
                     except Exception as e:
                         sys.stderr.write(f"Error uploading files to S3: {e}")
                         had_error = True
@@ -414,40 +408,66 @@ class RedisQueueWorker:
 
         return checker
 
-    def upload_files(self, obj: Any, upload_path_prefix: str) -> Any:
-        def upload_file(fh: io.IOBase) -> str:
-            filename = guess_filename(fh)
-            _, extension = os.path.splitext(filename)
-            if extension == ".jpg":
-                extension = ".jpeg"
+    def parse_content_type_extension(self, fh: io.IOBase) -> Tuple[Optional[str], str]:
+        filename = guess_filename(fh)
+        _, extension = os.path.splitext(filename)
+        if extension == ".jpg":
+            extension = ".jpeg"
 
-            content_type = None
-            if extension == ".jpeg":
-                content_type = "image/jpeg"
-            elif extension == ".png":
-                content_type = "image/png"
-            elif extension == ".webp":
-                content_type = "image/webp"
+        content_type = None
+        if extension == ".jpeg":
+            content_type = "image/jpeg"
+        elif extension == ".png":
+            content_type = "image/png"
+        elif extension == ".webp":
+            content_type = "image/webp"
 
-            extra_args = {}
-            if content_type is not None:
-                extra_args["ContentType"] = content_type
+        return content_type, extension
 
-            key = f"{str(uuid.uuid4())}{extension}"
-            if upload_path_prefix is not None and upload_path_prefix != "":
-                key = f"{ensure_trailing_slash(upload_path_prefix)}{key}"
+    def upload_to_s3(self, fh: io.IOBase, upload_path_prefix: str) -> str:
+        content_type, extension = self.parse_content_type_extension(fh)
 
-            start = time.time()
-            self.s3_client.Bucket(self.s3_bucket).upload_fileobj(
-                fh, key, ExtraArgs=extra_args
-            )
-            end = time.time()
-            print(f"Uploaded to S3 - {key} - {round((end - start) *1000)} ms")
+        extra_args = {}
+        if content_type is not None:
+            extra_args["ContentType"] = content_type
 
-            final_url = f"s3://{self.s3_bucket}/{key}"
-            return final_url
+        key = f"{str(uuid.uuid4())}{extension}"
+        if upload_path_prefix is not None and upload_path_prefix != "":
+            key = f"{ensure_trailing_slash(upload_path_prefix)}{key}"
 
-        return upload_files(obj, upload_file)
+        self.s3_client.Bucket(self.s3_bucket).upload_fileobj(
+            fh, key, ExtraArgs=extra_args
+        )
+        return f"s3://{self.s3_bucket}/{key}"
+
+    def upload_files(self, obj: Any, upload_path_prefix: str) -> Iterable[str]:
+        # Params for thread pool
+        params = []
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                params.append({"v": value, "arg": upload_path_prefix})
+        elif isinstance(obj, list):
+            for value in obj:
+                params.append({"v": value, "arg": upload_path_prefix})
+        else:
+            params.append({"v": obj, "arg": upload_path_prefix})
+
+        start = time.time()
+        # Run all uploads at same time in threadpool
+        tasks: List[Future] = []
+        with ThreadPoolExecutor(max_workers=len(params)) as executor:
+            for p in params:
+                tasks.append(executor.submit(self.upload_to_s3, p["v"], p["arg"]))
+
+        # Get results
+        results = []
+        for task in tasks:
+            results.append(task.result())
+
+        end = time.time()
+        print(f"Uploaded to S3 - {key} - {round((end - start) *1000)} ms")
+
+        return results
 
 
 def calculate_time_in_queue(message_id: str) -> float:
