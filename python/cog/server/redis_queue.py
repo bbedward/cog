@@ -374,7 +374,7 @@ class RedisQueueWorker:
                     assert output_type is None, "Predictor returned unexpected output"
                     output_type = event
                     if output_type.multi:
-                        response["output"] = {}
+                        response["output"] = []
                 elif isinstance(event, PredictionOutput):
                     # Note: this error message will be seen by users so it is
                     # intentionally vague about what has gone wrong.
@@ -396,6 +396,7 @@ class RedisQueueWorker:
                             raise Exception("Missing outputs and nsfw_count")
 
                         # Sometimes we could have, 0 outputs but a >0 nsfw_count
+                        response["output"] = []
                         if len(event.payload["outputs"]) > 0:
                             # Copy files to memory
                             for output in event.payload["outputs"]:
