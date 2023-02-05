@@ -346,7 +346,7 @@ class RedisQueueWorker:
                             event.payload, upload_prefix
                         )
                     except Exception as e:
-                        sys.stderr.write(f"Error uploading files to S3: {e}")
+                        sys.stderr.write(f"Error uploading files to S3: {e}\n")
                         had_error = True
 
                 elif isinstance(event, Done):
@@ -479,7 +479,7 @@ class RedisQueueWorker:
             results.append(task.result())
 
         end = time.time()
-        print(f"Uploaded to S3 - {key} - {round((end - start) *1000)} ms")
+        print(f"Uploaded to S3 - {round((end - start) *1000)} ms")
 
         return results
 
