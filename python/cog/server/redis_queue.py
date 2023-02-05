@@ -106,10 +106,6 @@ class RedisQueueWorker:
             f"Connected to Redis: {self.redis.get_connection_kwargs().get('host')}\n"
         )
 
-    def signal_exit(self, signum: Any, frame: Any) -> None:
-        self.should_exit = True
-        sys.stderr.write("Caught SIGTERM, exiting...\n")
-
     def receive_message(self) -> Tuple[Optional[str], Optional[str]]:
         # first, try to autoclaim old messages from pending queue
         raw_messages = self.redis.execute_command(
@@ -166,7 +162,6 @@ class RedisQueueWorker:
     def start(self) -> None:
         sys.stderr.write("Starting worker... Feb 5th Edition\n")
         with self.tracer.start_as_current_span(name="redis_queue.setup") as span:
-            signal.signal(signal.SIGTERM, self.signal_exit)
             started_at = datetime.datetime.now()
 
             setup_logs = ""
@@ -646,5 +641,9 @@ if __name__ == "__main__":
             max_failure_count=args.max_failure_count,
         )
 
-    Thread(target=worker.start).start()
-    Thread(target=worker.start_upload_thread).start()
+    workerThread = Thread(target=worker.start)
+    uploadThread = Thread(target=worker.start_upload_thread)
+    workerThread.start()
+    uploadThread.start()
+    workerThread.join()
+    uploadThread.join()
