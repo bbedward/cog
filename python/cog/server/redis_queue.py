@@ -272,7 +272,7 @@ class RedisQueueWorker:
         # that we echo back any additional fields sent to us
         response = message
         response["status"] = Status.PROCESSING
-        response["output"] = None
+        response["data"] = None
         response["logs"] = ""
 
         started_at = datetime.datetime.now()
@@ -330,7 +330,7 @@ class RedisQueueWorker:
                     assert output_type is None, "Predictor returned unexpected output"
                     output_type = event
                     if output_type.multi:
-                        response["output"] = []
+                        response["data"] = {}
                 elif isinstance(event, PredictionOutput):
                     # Note: this error message will be seen by users so it is
                     # intentionally vague about what has gone wrong.
@@ -342,9 +342,19 @@ class RedisQueueWorker:
                         upload_prefix = ""
                         if "upload_path_prefix" in input_obj.dict():
                             upload_prefix = input_obj.dict()["upload_path_prefix"]
-                        response["output"] = self.upload_files(
-                            event.payload, upload_prefix
-                        )
+                        if (
+                            len(event.payload["nsfw_count"]) == 0
+                            and len(event.payload["outputs"]) == 0
+                        ):
+                            raise Exception("Missing outputs and nsfw_count")
+                        if len(event.payload["outputs"]) > 0:
+                            files = self.upload_files(
+                                event.payload["outputs"], upload_prefix
+                            )
+                        response["data"] = {
+                            "outputs": files,
+                            "nsfw_count": event.payload["nsfw_count"],
+                        }
                     except Exception as e:
                         sys.stderr.write(f"Error uploading files to S3: {e}\n")
                         had_error = True
