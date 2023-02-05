@@ -2,12 +2,14 @@ import datetime
 import io
 import json
 import os
+import queue
 import signal
 import sys
 import time
 import traceback
 from argparse import ArgumentParser
 from concurrent.futures import Future, ThreadPoolExecutor
+from threading import Thread
 from mimetypes import guess_type
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple, List
 from urllib.parse import urlparse
@@ -39,6 +41,19 @@ from .worker import Worker
 from ..types import Path
 
 
+# A class for holding prediction output data for upload queue
+class UploadObject:
+    def __init__(
+        self,
+        contentType: Optional[str],
+        data: io.BytesIO,
+        extension: str,
+    ):
+        self.contentType = contentType
+        self.data = data
+        self.extension = extension
+
+
 class RedisQueueWorker:
     SETUP_TIME_QUEUE_SUFFIX = "-setup-time"
     RUN_TIME_QUEUE_SUFFIX = "-run-time"
@@ -57,6 +72,8 @@ class RedisQueueWorker:
         report_setup_run_url: Optional[str] = None,
         max_failure_count: Optional[int] = None,
     ):
+        # We want to do upload on a separate thread so use a queue to
+        self.upload_queue: queue.Queue[Dict[str, Any]] = queue.Queue()
         self.worker = Worker(predictor_ref)
         self.redis_url = redis_url
         self.input_queue = input_queue
@@ -127,8 +144,27 @@ class RedisQueueWorker:
         key, raw_message = raw_messages[0][1][0]
         return key.decode(), raw_message[b"value"].decode()
 
+    def start_upload_thread(self) -> None:
+        """Reads upload queue, uploads files, sends response to redis or webhook like normal"""
+        sys.stderr.write("Starting upload thread...\n")
+        while not self.should_exit:
+            uploadMsg: Dict[str, Any] = self.upload_queue.get()
+            if "upload_outputs" in uploadMsg:
+                upload_outputs: List[UploadObject] = uploadMsg["upload_outputs"]
+                try:
+                    uploadMsg["output"] = self.upload_files(
+                        upload_outputs, uploadMsg["upload_prefix"]
+                    )
+                    del uploadMsg["upload_outputs"]
+                except Exception as e:
+                    sys.stderr.write(f"Error uploading files: {e}\n")
+                    uploadMsg["status"] = Status.FAILED
+                    uploadMsg["error"] = str(e)
+                finally:
+                    self.send_response(uploadMsg)
+
     def start(self) -> None:
-        sys.stderr.write("Starting worker... v1673808327 \n")
+        sys.stderr.write("Starting worker... Feb 5th Edition\n")
         with self.tracer.start_as_current_span(name="redis_queue.setup") as span:
             signal.signal(signal.SIGTERM, self.signal_exit)
             started_at = datetime.datetime.now()
@@ -207,10 +243,10 @@ class RedisQueueWorker:
                 ) as span:
                     webhook = message.get("webhook")
                     if webhook is not None:
-                        send_response = webhook_caller(webhook)
+                        self.send_response = webhook_caller(webhook)
                     else:
                         redis_key = message["redis_pubsub_key"]
-                        send_response = self.redis_publisher(redis_key)
+                        self.send_response = self.redis_publisher(redis_key)
 
                     sys.stderr.write(
                         f"Received message {message_id} on {self.input_queue}\n"
@@ -237,8 +273,13 @@ class RedisQueueWorker:
                     for response_event, response in self.run_prediction(
                         message, should_cancel
                     ):
-                        if response_event in events_filter:
-                            send_response(response)
+                        if (
+                            "upload_outputs" in response
+                            and len(response["upload_outputs"]) > 0
+                        ):
+                            self.upload_queue.put(response)
+                        elif response_event in events_filter:
+                            self.send_response(response)
 
                     if self.max_failure_count is not None:
                         # Keep track of runs of failures to catch the situation
@@ -302,6 +343,9 @@ class RedisQueueWorker:
         output_type = None
         had_error = False
 
+        # If we have outputs that we need to upload
+        response["upload_outputs"] = []
+
         try:
             for event in self.worker.predict(payload=input_obj.dict(), poll=0.1):
                 if not was_canceled and should_cancel():
@@ -339,9 +383,11 @@ class RedisQueueWorker:
                     ), "Predictor returned unexpected output"
 
                     try:
-                        upload_prefix = ""
+                        response["upload_prefix"] = ""
                         if "upload_path_prefix" in input_obj.dict():
-                            upload_prefix = input_obj.dict()["upload_path_prefix"]
+                            response["upload_prefix"] = input_obj.dict()[
+                                "upload_path_prefix"
+                            ]
 
                         if (
                             event.payload["nsfw_count"] == 0
@@ -351,9 +397,22 @@ class RedisQueueWorker:
 
                         # Sometimes we could have, 0 outputs but a >0 nsfw_count
                         if len(event.payload["outputs"]) > 0:
-                            response["output"] = self.upload_files(
-                                event.payload["outputs"], upload_prefix
-                            )
+                            # Copy files to memory
+                            for output in event.payload["outputs"]:
+                                with open(output, "rb") as f:
+                                    obytes = io.BytesIO()
+                                    obytes.write(f.read())
+                                    (
+                                        content_type,
+                                        extension,
+                                    ) = self.parse_content_type_extension(f)
+                                    response["upload_outputs"].append(
+                                        UploadObject(
+                                            contentType=content_type,
+                                            extension=extension,
+                                            data=obytes,
+                                        )
+                                    )
                         response["nsfw_count"] = event.payload["nsfw_count"]
                     except Exception as e:
                         sys.stderr.write(f"Error uploading files to S3: {e}\n")
@@ -451,37 +510,18 @@ class RedisQueueWorker:
         )
         return f"s3://{self.s3_bucket}/{key}"
 
-    def upload_to_s3_from_file(self, obj: Any, upload_path_prefix: str) -> str:
-        with obj.open("rb") as f:
-            return self.upload_to_s3(f, upload_path_prefix)
-
-    def upload_files(self, obj: Any, upload_path_prefix: str) -> Iterable[str]:
-        # Params for thread pool
-        params = []
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                params.append(value)
-        elif isinstance(obj, list):
-            for value in obj:
-                params.append(value)
-        else:
-            params.append(obj)
-
+    def upload_files(
+        self, uploadObjects: List[UploadObject], upload_path_prefix: str
+    ) -> Iterable[str]:
+        """Upload all files to S3 in parallel and return the S3 URLs"""
         start = time.time()
         # Run all uploads at same time in threadpool
         tasks: List[Future] = []
-        with ThreadPoolExecutor(max_workers=len(params)) as executor:
-            for p in params:
-                if isinstance(p, Path):
-                    tasks.append(
-                        executor.submit(
-                            self.upload_to_s3_from_file, p, upload_path_prefix
-                        )
-                    )
-                else:
-                    tasks.append(
-                        executor.submit(self.upload_to_s3, p, upload_path_prefix)
-                    )
+        with ThreadPoolExecutor(max_workers=len(uploadObjects)) as executor:
+            for uo in uploadObjects:
+                tasks.append(
+                    executor.submit(self.upload_to_s3, uo.data, upload_path_prefix)
+                )
 
         # Get results
         results = []
@@ -605,4 +645,5 @@ if __name__ == "__main__":
             max_failure_count=args.max_failure_count,
         )
 
-    worker.start()
+    Thread(target=worker.start).start()
+    Thread(target=worker.start_upload_thread).start()
