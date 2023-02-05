@@ -344,7 +344,7 @@ class RedisQueueWorker:
                             upload_prefix = input_obj.dict()["upload_path_prefix"]
 
                         if (
-                            len(event.payload["nsfw_count"]) == 0
+                            event.payload["nsfw_count"] == 0
                             and len(event.payload["outputs"]) == 0
                         ):
                             raise Exception("Missing outputs and nsfw_count")
