@@ -500,6 +500,10 @@ class RedisQueueWorker:
         extension: str,
         upload_path_prefix: str,
     ) -> str:
+        extra_args = {}
+        if content_type is not None:
+            extra_args["ContentType"] = content_type
+
         key = f"{str(uuid.uuid4())}{extension}"
         if upload_path_prefix is not None and upload_path_prefix != "":
             key = f"{ensure_trailing_slash(upload_path_prefix)}{key}"
@@ -507,8 +511,8 @@ class RedisQueueWorker:
         sys.stderr.write(f"Uploading file with {fh.getbuffer().nbytes} bytes to S3")
 
         fh.seek(0)
-        self.s3_client.Bucket(self.s3_bucket).put_object(
-            Key=key, Body=fh, ContentType=content_type
+        self.s3_client.Bucket(self.s3_bucket).upload_fileobj(
+            fh, key, ExtraArgs=extra_args
         )
         fh.close()
 
