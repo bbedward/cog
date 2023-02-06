@@ -106,6 +106,11 @@ class BaseInput(BaseModel):
         Cleanup any temporary files created by the input.
         """
         for _, value in self:
+            if isinstance(value, Dict):
+                for _, v in value:
+                    if isinstance(v, Path):
+                        if v.exists():
+                            v.unlink()
             # Handle URLPath objects specially for cleanup.
             if isinstance(value, URLPath):
                 value.unlink()
