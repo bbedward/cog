@@ -50,7 +50,7 @@ class UploadObject:
         contentType: Optional[str],
         data: Any,
         extension: str,
-        params: any,
+        params: Any,
     ):
         self.contentType = contentType
         self.data = data
