@@ -488,7 +488,7 @@ class RedisQueueWorker:
 
     def upload_to_s3(
         self,
-        fh: io.BytesIO,
+        fh: str,
         content_type: str | None,
         extension: str,
         upload_path_prefix: str,
@@ -501,11 +501,9 @@ class RedisQueueWorker:
         if upload_path_prefix is not None and upload_path_prefix != "":
             key = f"{ensure_trailing_slash(upload_path_prefix)}{key}"
 
-        fh.seek(0)
         self.s3_client.Bucket(self.s3_bucket).upload_fileobj(
             fh, key, ExtraArgs=extra_args
         )
-        fh.close()
 
         return f"s3://{self.s3_bucket}/{key}"
 
@@ -521,13 +519,12 @@ class RedisQueueWorker:
                 startCv2 = time.time()
                 cv2img = cv2.imread(uo.output_path)
                 encoded = cv2.imencode(uo.extension, cv2img, params=uo.params)[1]
-                fh = io.BytesIO(np.array(encoded).tobytes())
                 endCv2 = time.time()
                 print(f"cv2 - {round((endCv2 - startCv2) *1000)} ms")
                 tasks.append(
                     executor.submit(
                         self.upload_to_s3,
-                        fh,
+                        encoded.tostring(),
                         uo.content_type,
                         uo.extension,
                         upload_path_prefix,
