@@ -490,20 +490,21 @@ class RedisQueueWorker:
 
         return content_type, extension
 
-    def upload_to_s3(self, fh: io.IOBase, upload_path_prefix: str) -> str:
-        content_type, extension = self.parse_content_type_extension(fh)
-
-        extra_args = {}
-        if content_type is not None:
-            extra_args["ContentType"] = content_type
-
+    def upload_to_s3(
+        self,
+        fh: io.IOBase,
+        content_type: str | None,
+        extension: str,
+        upload_path_prefix: str,
+    ) -> str:
         key = f"{str(uuid.uuid4())}{extension}"
         if upload_path_prefix is not None and upload_path_prefix != "":
             key = f"{ensure_trailing_slash(upload_path_prefix)}{key}"
 
-        self.s3_client.Bucket(self.s3_bucket).upload_fileobj(
-            fh, key, ExtraArgs=extra_args
+        self.s3_client.Bucket(self.s3_bucket).put_object(
+            Key=key, Body=fh, ContentType=content_type
         )
+
         return f"s3://{self.s3_bucket}/{key}"
 
     def upload_files(
@@ -516,7 +517,13 @@ class RedisQueueWorker:
         with ThreadPoolExecutor(max_workers=len(uploadObjects)) as executor:
             for uo in uploadObjects:
                 tasks.append(
-                    executor.submit(self.upload_to_s3, uo.data, upload_path_prefix)
+                    executor.submit(
+                        self.upload_to_s3,
+                        uo.data,
+                        uo.contentType,
+                        uo.extension,
+                        upload_path_prefix,
+                    )
                 )
 
         # Get results
