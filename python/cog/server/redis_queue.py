@@ -47,13 +47,13 @@ from ..types import Path
 class UploadObject:
     def __init__(
         self,
-        contentType: Optional[str],
-        image: Path,
+        content_type: Optional[str],
+        output_path: Path,
         extension: str,
         params: Any,
     ):
-        self.contentType = contentType
-        self.image = image
+        self.content_type = content_type
+        self.output_path = output_path
         self.extension = extension
         self.params = params
 
@@ -405,9 +405,9 @@ class RedisQueueWorker:
                                 )
                                 response["upload_outputs"].append(
                                     UploadObject(
-                                        contentType=content_type,
+                                        content_type=content_type,
                                         extension=output["extension"],
-                                        image=output["output_path"],
+                                        output_path=output["output_path"],
                                         params=output["params"],
                                     )
                                 )
@@ -477,11 +477,11 @@ class RedisQueueWorker:
         return checker
 
     def parse_content_type(self, extension: str) -> Optional[str]:
-        if extension == ".jpeg":
+        if extension == "jpeg" or extension == "jpg":
             return "image/jpeg"
-        elif extension == ".png":
+        elif extension == "png":
             return "image/png"
-        elif extension == ".webp":
+        elif extension == "webp":
             return "image/webp"
 
         return None
@@ -519,7 +519,7 @@ class RedisQueueWorker:
         with ThreadPoolExecutor(max_workers=len(uploadObjects)) as executor:
             for uo in uploadObjects:
                 startCv2 = time.time()
-                cv2img = cv2.imread(uo.image)
+                cv2img = cv2.imread(uo.output_path)
                 encoded = cv2.imencode(uo.extension, cv2img, params=uo.params)[1]
                 fh = io.BytesIO(np.array(encoded).tobytes())
                 endCv2 = time.time()
@@ -528,7 +528,7 @@ class RedisQueueWorker:
                     executor.submit(
                         self.upload_to_s3,
                         fh,
-                        uo.contentType,
+                        uo.content_type,
                         uo.extension,
                         upload_path_prefix,
                     )
