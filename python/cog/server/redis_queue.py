@@ -48,12 +48,12 @@ class UploadObject:
     def __init__(
         self,
         content_type: Optional[str],
-        output_path: Path,
+        image_bytes: bytes,
         extension: str,
         params: Any,
     ):
         self.content_type = content_type
-        self.output_path = output_path
+        self.image_bytes = image_bytes
         self.extension = extension
         self.params = params
 
@@ -407,7 +407,7 @@ class RedisQueueWorker:
                                     UploadObject(
                                         content_type=content_type,
                                         extension=output["extension"],
-                                        output_path=output["output_path"],
+                                        image_bytes=output["image_bytes"],
                                         params=output["params"],
                                     )
                                 )
@@ -517,7 +517,7 @@ class RedisQueueWorker:
         with ThreadPoolExecutor(max_workers=len(uploadObjects)) as executor:
             for uo in uploadObjects:
                 startCv2 = time.time()
-                cv2img = cv2.imread(uo.output_path)
+                cv2img = cv2.imread(uo.image_bytes)
                 encoded = cv2.imencode(uo.extension, cv2img, params=uo.params)[1]
                 endCv2 = time.time()
                 print(f"cv2 - {round((endCv2 - startCv2) *1000)} ms")
