@@ -398,9 +398,6 @@ class RedisQueueWorker:
                                 with open(output, "rb") as f:
                                     obytes = io.BytesIO()
                                     obytes.write(f.read())
-                                    sys.stderr.write(
-                                        f"Read {obytes.getbuffer().nbytes} bytes from {output}"
-                                    )
                                     (
                                         content_type,
                                         extension,
@@ -508,8 +505,6 @@ class RedisQueueWorker:
         if upload_path_prefix is not None and upload_path_prefix != "":
             key = f"{ensure_trailing_slash(upload_path_prefix)}{key}"
 
-        sys.stderr.write(f"Uploading file with {fh.getbuffer().nbytes} bytes to S3")
-
         fh.seek(0)
         self.s3_client.Bucket(self.s3_bucket).upload_fileobj(
             fh, key, ExtraArgs=extra_args
@@ -527,9 +522,6 @@ class RedisQueueWorker:
         tasks: List[Future] = []
         with ThreadPoolExecutor(max_workers=len(uploadObjects)) as executor:
             for uo in uploadObjects:
-                sys.stderr.write(
-                    f"Uploading {uo.extension}, {uo.contentType} file to S3"
-                )
                 tasks.append(
                     executor.submit(
                         self.upload_to_s3,
