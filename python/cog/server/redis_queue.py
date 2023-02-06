@@ -407,7 +407,7 @@ class RedisQueueWorker:
                                     UploadObject(
                                         contentType=content_type,
                                         extension=output["extension"],
-                                        image=output["image"],
+                                        image=output["output_path"],
                                         params=output["params"],
                                     )
                                 )
