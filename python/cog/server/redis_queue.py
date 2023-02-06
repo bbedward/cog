@@ -17,9 +17,11 @@ from urllib.parse import urlparse
 import boto3
 from boto3_type_annotations.s3 import ServiceResource
 from botocore.config import Config
+import cv2
 import redis
 import requests
 import uuid
+import numpy as np
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.trace import TracerProvider
@@ -46,12 +48,14 @@ class UploadObject:
     def __init__(
         self,
         contentType: Optional[str],
-        data: io.BytesIO,
+        data: Any,
         extension: str,
+        params: any,
     ):
         self.contentType = contentType
         self.data = data
         self.extension = extension
+        self.params = params
 
 
 class RedisQueueWorker:
@@ -395,20 +399,17 @@ class RedisQueueWorker:
                         if len(event.payload["outputs"]) > 0:
                             # Copy files to memory
                             for output in event.payload["outputs"]:
-                                with open(output, "rb") as f:
-                                    obytes = io.BytesIO()
-                                    obytes.write(f.read())
-                                    (
-                                        content_type,
-                                        extension,
-                                    ) = self.parse_content_type_extension(f)
-                                    response["upload_outputs"].append(
-                                        UploadObject(
-                                            contentType=content_type,
-                                            extension=extension,
-                                            data=obytes,
-                                        )
+                                content_type = self.parse_content_type(
+                                    output["extension"]
+                                )
+                                response["upload_outputs"].append(
+                                    UploadObject(
+                                        contentType=content_type,
+                                        extension=output["extension"],
+                                        data=output["image"],
+                                        params=output["params"],
                                     )
+                                )
                         response["nsfw_count"] = event.payload["nsfw_count"]
                     except Exception as e:
                         sys.stderr.write(f"Error uploading files to S3: {e}\n")
@@ -474,21 +475,15 @@ class RedisQueueWorker:
 
         return checker
 
-    def parse_content_type_extension(self, fh: io.IOBase) -> Tuple[Optional[str], str]:
-        filename = guess_filename(fh)
-        _, extension = os.path.splitext(filename)
-        if extension == ".jpg":
-            extension = ".jpeg"
-
-        content_type = None
+    def parse_content_type(self, extension: str) -> Optional[str]:
         if extension == ".jpeg":
-            content_type = "image/jpeg"
+            return "image/jpeg"
         elif extension == ".png":
-            content_type = "image/png"
+            return "image/png"
         elif extension == ".webp":
-            content_type = "image/webp"
+            return "image/webp"
 
-        return content_type, extension
+        return None
 
     def upload_to_s3(
         self,
@@ -522,10 +517,18 @@ class RedisQueueWorker:
         tasks: List[Future] = []
         with ThreadPoolExecutor(max_workers=len(uploadObjects)) as executor:
             for uo in uploadObjects:
+                startCv2 = time.time()
+                mat = cv2.cvtColor(uo.data, cv2.COLOR_RGB2BGR)
+                encoded = cv2.imencode(uo.extension, mat, params=uo.params)[1]
+                data_encode = np.array(encoded)
+                as_bytes = data_encode.tobytes()
+                as_bytesio = io.BytesIO(as_bytes)
+                endCv2 = time.time()
+                print(f"cv2 - {round((endCv2 - startCv2) *1000)} ms")
                 tasks.append(
                     executor.submit(
                         self.upload_to_s3,
-                        uo.data,
+                        as_bytesio,
                         uo.contentType,
                         uo.extension,
                         upload_path_prefix,
