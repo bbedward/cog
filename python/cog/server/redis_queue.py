@@ -523,12 +523,7 @@ class RedisQueueWorker:
             for uo in uploadObjects:
                 startCv2 = time.time()
                 sys.stderr.write(f"in: upload image of of type {type(uo.image)}")
-                memfile = io.BytesIO()
-                memfile.write(uo.image)
-                memfile.seek(0)
-                image = np.load(memfile)
-                memfile.close()
-                mat = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+                mat = cv2.cvtColor(uo.image, cv2.COLOR_RGB2BGR)
                 encoded = cv2.imencode(uo.extension, mat, params=uo.params)[1]
                 data_encode = np.array(encoded)
                 as_bytes = data_encode.tobytes()
