@@ -488,21 +488,17 @@ class RedisQueueWorker:
 
     def upload_to_s3(
         self,
-        fh: str,
+        file_bytes: bytes,
         content_type: str | None,
         extension: str,
         upload_path_prefix: str,
     ) -> str:
-        extra_args = {}
-        if content_type is not None:
-            extra_args["ContentType"] = content_type
-
         key = f"{str(uuid.uuid4())}{extension}"
         if upload_path_prefix is not None and upload_path_prefix != "":
             key = f"{ensure_trailing_slash(upload_path_prefix)}{key}"
 
-        self.s3_client.Bucket(self.s3_bucket).upload_fileobj(
-            fh, key, ExtraArgs=extra_args
+        self.s3_client.Bucket(self.s3_bucket).put_object(
+            Body=file_bytes, Key=key, ContentType=content_type
         )
 
         return f"s3://{self.s3_bucket}/{key}"
@@ -524,7 +520,7 @@ class RedisQueueWorker:
                 tasks.append(
                     executor.submit(
                         self.upload_to_s3,
-                        encoded.tostring(),
+                        encoded.tobytes(),
                         uo.content_type,
                         uo.extension,
                         upload_path_prefix,
