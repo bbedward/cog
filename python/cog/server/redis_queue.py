@@ -48,7 +48,7 @@ class UploadObject:
     def __init__(
         self,
         contentType: Optional[str],
-        image: Any,
+        image: Path,
         extension: str,
         params: Any,
     ):
@@ -403,9 +403,6 @@ class RedisQueueWorker:
                                 content_type = self.parse_content_type(
                                     output["extension"]
                                 )
-                                sys.stderr.write(
-                                    f"image of of type {type(output['image'])}"
-                                )
                                 response["upload_outputs"].append(
                                     UploadObject(
                                         contentType=content_type,
@@ -522,18 +519,15 @@ class RedisQueueWorker:
         with ThreadPoolExecutor(max_workers=len(uploadObjects)) as executor:
             for uo in uploadObjects:
                 startCv2 = time.time()
-                sys.stderr.write(f"in: upload image of of type {type(uo.image)}")
-                mat = cv2.cvtColor(uo.image, cv2.COLOR_RGB2BGR)
-                encoded = cv2.imencode(uo.extension, mat, params=uo.params)[1]
-                data_encode = np.array(encoded)
-                as_bytes = data_encode.tobytes()
-                as_bytesio = io.BytesIO(as_bytes)
+                cv2img = cv2.imread(uo.image)
+                encoded = cv2.imencode(uo.extension, cv2img, params=uo.params)[1]
+                fh = io.BytesIO(np.array(encoded).tobytes())
                 endCv2 = time.time()
                 print(f"cv2 - {round((endCv2 - startCv2) *1000)} ms")
                 tasks.append(
                     executor.submit(
                         self.upload_to_s3,
-                        as_bytesio,
+                        fh,
                         uo.contentType,
                         uo.extension,
                         upload_path_prefix,
