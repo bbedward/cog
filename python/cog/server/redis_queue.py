@@ -48,12 +48,12 @@ class UploadObject:
     def __init__(
         self,
         contentType: Optional[str],
-        data: Any,
+        image: Any,
         extension: str,
         params: Any,
     ):
         self.contentType = contentType
-        self.data = data
+        self.image = image
         self.extension = extension
         self.params = params
 
@@ -155,12 +155,13 @@ class RedisQueueWorker:
                     uploadMsg["output"] = self.upload_files(
                         upload_outputs, uploadMsg["upload_prefix"]
                     )
-                    del uploadMsg["upload_outputs"]
                 except Exception as e:
                     sys.stderr.write(f"Error uploading files: {e}\n")
                     uploadMsg["status"] = Status.FAILED
                     uploadMsg["error"] = str(e)
                 finally:
+                    if "upload_outputs" in uploadMsg:
+                        del uploadMsg["upload_outputs"]
                     self.send_response(uploadMsg)
 
     def start(self) -> None:
@@ -402,11 +403,14 @@ class RedisQueueWorker:
                                 content_type = self.parse_content_type(
                                     output["extension"]
                                 )
+                                sys.stderr.write(
+                                    f"image of of type {type(output['image'])}"
+                                )
                                 response["upload_outputs"].append(
                                     UploadObject(
                                         contentType=content_type,
                                         extension=output["extension"],
-                                        data=output["image"],
+                                        image=output["image"],
                                         params=output["params"],
                                     )
                                 )
@@ -518,7 +522,8 @@ class RedisQueueWorker:
         with ThreadPoolExecutor(max_workers=len(uploadObjects)) as executor:
             for uo in uploadObjects:
                 startCv2 = time.time()
-                mat = cv2.cvtColor(uo.data, cv2.COLOR_RGB2BGR)
+                sys.stderr.write(f"in: upload image of of type {type(uo.image)}")
+                mat = cv2.cvtColor(uo.image, cv2.COLOR_RGB2BGR)
                 encoded = cv2.imencode(uo.extension, mat, params=uo.params)[1]
                 data_encode = np.array(encoded)
                 as_bytes = data_encode.tobytes()
