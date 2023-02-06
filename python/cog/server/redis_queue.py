@@ -506,9 +506,11 @@ class RedisQueueWorker:
 
         sys.stderr.write(f"Uploading file with {fh.getbuffer().nbytes} bytes to S3")
 
+        fh.seek(0)
         self.s3_client.Bucket(self.s3_bucket).put_object(
             Key=key, Body=fh, ContentType=content_type
         )
+        fh.close()
 
         return f"s3://{self.s3_bucket}/{key}"
 
