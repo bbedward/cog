@@ -41,21 +41,22 @@ from .probes import ProbeHelper
 from .webhook import requests_session, webhook_caller
 from .worker import Worker
 from ..types import Path
-
+from PIL import Image
+from io import BytesIO
 
 # A class for holding prediction output data for upload queue
 class UploadObject:
     def __init__(
         self,
         content_type: Optional[str],
-        image_bytes: bytes,
+        pil_image: Image,
         extension: str,
-        params: Any,
+        quality: int,
     ):
         self.content_type = content_type
-        self.image_bytes = image_bytes
+        self.pil_image = pil_image
         self.extension = extension
-        self.params = params
+        self.quality = quality
 
 
 class RedisQueueWorker:
@@ -407,8 +408,8 @@ class RedisQueueWorker:
                                     UploadObject(
                                         content_type=content_type,
                                         extension=output["extension"],
-                                        image_bytes=output["image_bytes"],
-                                        params=output["params"],
+                                        pil_image=output["pil_image"],
+                                        quality=output["quality"],
                                     )
                                 )
                         response["nsfw_count"] = event.payload["nsfw_count"]
@@ -513,16 +514,16 @@ class RedisQueueWorker:
         with ThreadPoolExecutor(max_workers=len(uploadObjects)) as executor:
             for uo in uploadObjects:
                 startCv2 = time.time()
-                npArray = np.frombuffer(uo.image_bytes, dtype=np.uint8)
-                decoded = cv2.imdecode(npArray, cv2.IMREAD_COLOR)
-                mat = cv2.cvtColor(decoded, cv2.COLOR_RGB2BR)
-                encoded = cv2.imencode(uo.extension, mat, params=uo.params)[1]
+                img_format = uo.extension[1:].upper()
+                img_bytes = BytesIO()
+                uo.pil_image.save(img_bytes, format=img_format, quality=uo.quality)
+                file_bytes = img_bytes.getvalue()
                 endCv2 = time.time()
                 print(f"cv2 - {round((endCv2 - startCv2) *1000)} ms")
                 tasks.append(
                     executor.submit(
                         self.upload_to_s3,
-                        encoded.tobytes(),
+                        file_bytes,
                         uo.content_type,
                         uo.extension,
                         upload_path_prefix,
