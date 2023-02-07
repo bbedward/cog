@@ -42,6 +42,7 @@ from ..types import Path
 from PIL import Image
 from io import BytesIO
 
+
 # A class for holding prediction output data for upload queue
 class UploadObject:
     def __init__(
@@ -444,7 +445,7 @@ class RedisQueueWorker:
                     "predict_time": (completed_at - started_at).total_seconds()
                 }
         except Exception as e:
-            self.should_exit = True
+            sys.stderr.write(f"Error in prediction: {e}\n")
             completed_at = datetime.datetime.now()
             response["completed_at"] = format_datetime(completed_at)
             response["status"] = Status.FAILED
@@ -487,19 +488,13 @@ class RedisQueueWorker:
 
     def convert_and_upload_to_s3(
         self,
-        image_bytes: bytes,
-        image_width: int,
-        image_height: int,
+        pil_image: Image,
         target_quality: int,
         target_extension: str,
         upload_path_prefix: str,
     ) -> str:
         start_conv = time.time()
         img_format = target_extension[1:].upper()
-        mode = "RGBA"
-        if img_format == "JPEG":
-            mode = "RGB"
-        pil_image = Image.frombytes(mode, (image_width, image_height), image_bytes)
         img_bytes = BytesIO()
         pil_image.save(img_bytes, format=img_format, quality=target_quality)
         file_bytes = img_bytes.getvalue()
@@ -531,12 +526,17 @@ class RedisQueueWorker:
         tasks: List[Future] = []
         with ThreadPoolExecutor(max_workers=len(uploadObjects)) as executor:
             for uo in uploadObjects:
+                img_format = uo.target_extension[1:].upper()
+                mode = "RGBA"
+                if img_format == "JPEG":
+                    mode = "RGB"
+                pil_image = Image.frombytes(
+                    mode, (uo.image_width, uo.image_height), uo.image_bytes
+                )
                 tasks.append(
                     executor.submit(
                         self.convert_and_upload_to_s3,
-                        uo.image_bytes,
-                        uo.image_width,
-                        uo.image_height,
+                        pil_image,
                         uo.target_quality,
                         uo.target_extension,
                         upload_path_prefix,
