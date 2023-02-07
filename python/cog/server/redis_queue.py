@@ -46,11 +46,15 @@ from io import BytesIO
 class UploadObject:
     def __init__(
         self,
-        pil_image: Image,
+        image_bytes: bytes,
+        image_width: int,
+        image_height: int,
         target_extension: str,
         target_quality: int,
     ):
-        self.pil_image = pil_image
+        self.image_bytes = image_bytes
+        self.image_width = image_width
+        self.image_height = image_height
         self.target_extension = target_extension
         self.target_quality = target_quality
 
@@ -399,7 +403,9 @@ class RedisQueueWorker:
                             for output in event.payload["outputs"]:
                                 response["upload_outputs"].append(
                                     UploadObject(
-                                        pil_image=output["pil_image"],
+                                        image_bytes=output["image_bytes"],
+                                        image_width=output["image_width"],
+                                        image_height=output["image_height"],
                                         target_quality=output["target_quality"],
                                         target_extension=output["target_extension"],
                                     )
@@ -481,15 +487,19 @@ class RedisQueueWorker:
 
     def convert_and_upload_to_s3(
         self,
-        pil_image: Image,
+        image_bytes: bytes,
+        image_width: int,
+        image_height: int,
         target_quality: int,
         target_extension: str,
         upload_path_prefix: str,
     ) -> str:
         start_conv = time.time()
-        if target_extension == ".jpeg":
-            pil_image = pil_image.convert("RGB")
         img_format = target_extension[1:].upper()
+        mode = "RGBA"
+        if img_format == "JPEG":
+            mode = "RGB"
+        pil_image = Image.frombytes(mode, (image_width, image_height), image_bytes)
         img_bytes = BytesIO()
         pil_image.save(img_bytes, format=img_format, quality=target_quality)
         file_bytes = img_bytes.getvalue()
@@ -517,11 +527,6 @@ class RedisQueueWorker:
         print("Started - Upload all files to S3 in parallel and return the S3 URLs")
         start = time.time()
 
-        # Load stuff in here or it doesn't work in threadpool
-        for uo in uploadObjects:
-            uo.pil_image.load()
-        print(f"Loaded all images in: {round((time.time() - start) *1000)} ms")
-
         # Run all uploads at same time in threadpool
         tasks: List[Future] = []
         with ThreadPoolExecutor(max_workers=len(uploadObjects)) as executor:
@@ -529,7 +534,9 @@ class RedisQueueWorker:
                 tasks.append(
                     executor.submit(
                         self.convert_and_upload_to_s3,
-                        uo.pil_image,
+                        uo.image_bytes,
+                        uo.image_width,
+                        uo.image_height,
                         uo.target_quality,
                         uo.target_extension,
                         upload_path_prefix,
