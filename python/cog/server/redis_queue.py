@@ -514,7 +514,7 @@ class RedisQueueWorker:
     def upload_files(
         self, uploadObjects: List[UploadObject], upload_path_prefix: str
     ) -> Iterable[str]:
-        """Upload all files to S3 in parallel and return the S3 URLs"""
+        print("Started - Upload all files to S3 in parallel and return the S3 URLs")
         start = time.time()
 
         # Load stuff in here or it doesn't work in threadpool
