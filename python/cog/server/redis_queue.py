@@ -519,7 +519,9 @@ class RedisQueueWorker:
                 uo.pil_image.save(img_bytes, format=img_format, quality=uo.quality)
                 file_bytes = img_bytes.getvalue()
                 endCv2 = time.time()
-                print(f"cv2 - {round((endCv2 - startCv2) *1000)} ms")
+                print(
+                    f"Converted image in: {round((endCv2 - startCv2) *1000)} ms - {img_format} - {uo.quality}"
+                )
                 tasks.append(
                     executor.submit(
                         self.upload_to_s3,
