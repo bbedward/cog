@@ -17,11 +17,9 @@ from urllib.parse import urlparse
 import boto3
 from boto3_type_annotations.s3 import ServiceResource
 from botocore.config import Config
-import cv2
 import redis
 import requests
 import uuid
-import numpy as np
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.trace import TracerProvider
@@ -48,15 +46,13 @@ from io import BytesIO
 class UploadObject:
     def __init__(
         self,
-        content_type: Optional[str],
         pil_image: Image,
-        extension: str,
-        quality: int,
+        target_extension: str,
+        target_quality: int,
     ):
-        self.content_type = content_type
         self.pil_image = pil_image
-        self.extension = extension
-        self.quality = quality
+        self.target_extension = target_extension
+        self.target_quality = target_quality
 
 
 class RedisQueueWorker:
@@ -401,15 +397,11 @@ class RedisQueueWorker:
                         if len(event.payload["outputs"]) > 0:
                             # Copy files to memory
                             for output in event.payload["outputs"]:
-                                content_type = self.parse_content_type(
-                                    output["extension"]
-                                )
                                 response["upload_outputs"].append(
                                     UploadObject(
-                                        content_type=content_type,
-                                        extension=output["extension"],
                                         pil_image=output["pil_image"],
-                                        quality=output["quality"],
+                                        target_quality=output["target_quality"],
+                                        target_extension=output["target_extension"],
                                     )
                                 )
                         response["nsfw_count"] = event.payload["nsfw_count"]
@@ -487,27 +479,29 @@ class RedisQueueWorker:
 
         return None
 
-    def upload_to_s3(
+    def convert_and_upload_to_s3(
         self,
         pil_image: Image,
-        quality: int,
-        content_type: str | None,
-        extension: str,
+        target_quality: int,
+        target_extension: str,
         upload_path_prefix: str,
     ) -> str:
         start_conv = time.time()
-        img_format = extension[1:].upper()
+        if target_extension == ".jpeg":
+            pil_image = pil_image.convert("RGB")
+        img_format = target_extension[1:].upper()
         img_bytes = BytesIO()
-        pil_image.save(img_bytes, format=img_format, quality=quality)
+        pil_image.save(img_bytes, format=img_format, quality=target_quality)
         file_bytes = img_bytes.getvalue()
         end_conv = time.time()
         print(
-            f"Converted image in: {round((end_conv - start_conv) *1000)} ms - {img_format} - {quality}"
+            f"Converted image in: {round((end_conv - start_conv) *1000)} ms - {img_format} - {target_quality}"
         )
-        key = f"{str(uuid.uuid4())}{extension}"
+        key = f"{str(uuid.uuid4())}{target_extension}"
         if upload_path_prefix is not None and upload_path_prefix != "":
             key = f"{ensure_trailing_slash(upload_path_prefix)}{key}"
 
+        content_type = self.parse_content_type(target_extension)
         start_upload = time.time()
         self.s3_client.Bucket(self.s3_bucket).put_object(
             Body=file_bytes, Key=key, ContentType=content_type
@@ -522,17 +516,22 @@ class RedisQueueWorker:
     ) -> Iterable[str]:
         """Upload all files to S3 in parallel and return the S3 URLs"""
         start = time.time()
+
+        # Load stuff in here or it doesn't work in threadpool
+        for uo in uploadObjects:
+            uo.pil_image.load()
+        print(f"Loaded all images in: {round((time.time() - start) *1000)} ms")
+
         # Run all uploads at same time in threadpool
         tasks: List[Future] = []
         with ThreadPoolExecutor(max_workers=len(uploadObjects)) as executor:
             for uo in uploadObjects:
                 tasks.append(
                     executor.submit(
-                        self.upload_to_s3,
+                        self.convert_and_upload_to_s3,
                         uo.pil_image,
-                        uo.quality,
-                        uo.content_type,
-                        uo.extension,
+                        uo.target_quality,
+                        uo.target_extension,
                         upload_path_prefix,
                     )
                 )
