@@ -526,6 +526,7 @@ class RedisQueueWorker:
         tasks: List[Future] = []
         with ThreadPoolExecutor(max_workers=len(uploadObjects)) as executor:
             for uo in uploadObjects:
+                start = time.time()
                 img_format = uo.target_extension[1:].upper()
                 mode = "RGBA"
                 if img_format == "JPEG":
@@ -534,6 +535,8 @@ class RedisQueueWorker:
                     mode, (uo.image_width, uo.image_height), uo.image_bytes
                 )
                 pil_image.load()
+                end = time.time()
+                print(f"Loaded image from bytes in: {round((end - start) *1000)} ms")
                 tasks.append(
                     executor.submit(
                         self.convert_and_upload_to_s3,
