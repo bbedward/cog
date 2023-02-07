@@ -536,6 +536,7 @@ class RedisQueueWorker:
                 )
                 pil_image.load()
                 end = time.time()
+                #
                 print(f"Loaded image from bytes in: {round((end - start) *1000)} ms")
                 tasks.append(
                     executor.submit(
