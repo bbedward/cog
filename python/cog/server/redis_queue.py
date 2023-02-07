@@ -489,18 +489,31 @@ class RedisQueueWorker:
 
     def upload_to_s3(
         self,
-        file_bytes: bytes,
+        pil_image: Image,
+        quality: int,
         content_type: str | None,
         extension: str,
         upload_path_prefix: str,
     ) -> str:
+        start_conv = time.time()
+        img_format = extension[1:].upper()
+        img_bytes = BytesIO()
+        pil_image.save(img_bytes, format=img_format, quality=quality)
+        file_bytes = img_bytes.getvalue()
+        end_conv = time.time()
+        print(
+            f"Converted image in: {round((end_conv - start_conv) *1000)} ms - {img_format} - {quality}"
+        )
         key = f"{str(uuid.uuid4())}{extension}"
         if upload_path_prefix is not None and upload_path_prefix != "":
             key = f"{ensure_trailing_slash(upload_path_prefix)}{key}"
 
+        start_upload = time.time()
         self.s3_client.Bucket(self.s3_bucket).put_object(
             Body=file_bytes, Key=key, ContentType=content_type
         )
+        end_upload = time.time()
+        print(f"Uploaded image in: {round((end_upload - start_upload) *1000)} ms")
 
         return f"s3://{self.s3_bucket}/{key}"
 
@@ -513,19 +526,11 @@ class RedisQueueWorker:
         tasks: List[Future] = []
         with ThreadPoolExecutor(max_workers=len(uploadObjects)) as executor:
             for uo in uploadObjects:
-                startCv2 = time.time()
-                img_format = uo.extension[1:].upper()
-                img_bytes = BytesIO()
-                uo.pil_image.save(img_bytes, format=img_format, quality=uo.quality)
-                file_bytes = img_bytes.getvalue()
-                endCv2 = time.time()
-                print(
-                    f"Converted image in: {round((endCv2 - startCv2) *1000)} ms - {img_format} - {uo.quality}"
-                )
                 tasks.append(
                     executor.submit(
                         self.upload_to_s3,
-                        file_bytes,
+                        uo.pil_image,
+                        uo.quality,
                         uo.content_type,
                         uo.extension,
                         upload_path_prefix,
@@ -538,7 +543,9 @@ class RedisQueueWorker:
             results.append(task.result())
 
         end = time.time()
-        print(f"Uploaded to S3 - {round((end - start) *1000)} ms")
+        print(
+            f"📤 All converted and uploaded to S3 in: {round((end - start) *1000)} ms 📤"
+        )
 
         return results
 
