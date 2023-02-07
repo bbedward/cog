@@ -513,8 +513,10 @@ class RedisQueueWorker:
         with ThreadPoolExecutor(max_workers=len(uploadObjects)) as executor:
             for uo in uploadObjects:
                 startCv2 = time.time()
-                cv2img = np.frombuffer(uo.image_bytes, dtype=np.uint8)
-                encoded = cv2.imencode(uo.extension, cv2img, params=uo.params)[1]
+                npArray = np.frombuffer(uo.image_bytes, dtype=np.uint8)
+                decoded = cv2.imdecode(npArray, cv2.IMREAD_COLOR)
+                mat = cv2.cvtColor(decoded, cv2.COLOR_RGB2BR)
+                encoded = cv2.imencode(uo.extension, mat, params=uo.params)[1]
                 endCv2 = time.time()
                 print(f"cv2 - {round((endCv2 - startCv2) *1000)} ms")
                 tasks.append(
