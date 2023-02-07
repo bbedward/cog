@@ -519,7 +519,6 @@ class RedisQueueWorker:
 
         # Load stuff in here or it doesn't work in threadpool
         for uo in uploadObjects:
-            print(f"Type of uo.pil_image: {type(uo.pil_image)}")
             uo.pil_image.load()
         print(f"Loaded all images in: {round((time.time() - start) *1000)} ms")
 
