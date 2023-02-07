@@ -533,6 +533,7 @@ class RedisQueueWorker:
                 pil_image = Image.frombytes(
                     mode, (uo.image_width, uo.image_height), uo.image_bytes
                 )
+                pil_image.load()
                 tasks.append(
                     executor.submit(
                         self.convert_and_upload_to_s3,
