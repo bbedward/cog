@@ -47,11 +47,11 @@ from io import BytesIO
 class UploadObject:
     def __init__(
         self,
-        image_path: Path,
+        image_bytes: bytes,
         target_extension: str,
         target_quality: int,
     ):
-        self.image_path = image_path
+        self.image_bytes = image_bytes
         self.target_extension = target_extension
         self.target_quality = target_quality
 
@@ -400,7 +400,7 @@ class RedisQueueWorker:
                             for output in event.payload["outputs"]:
                                 response["upload_outputs"].append(
                                     UploadObject(
-                                        image_path=output["image_path"],
+                                        image_bytes=output["image_bytes"],
                                         target_quality=output["target_quality"],
                                         target_extension=output["target_extension"],
                                     )
@@ -480,22 +480,34 @@ class RedisQueueWorker:
 
         return None
 
+    def convert_bytes_to_target(
+        self, image_bytes: bytes, target_extension: str, target_quality: int
+    ) -> bytes:
+        img_format = target_extension[1:].upper()
+        image = Image.open(BytesIO(image_bytes))
+
+        converted_bytes = BytesIO()
+        image.save(converted_bytes, format=img_format, quality=target_quality)
+        converted_bytes.seek(0)
+
+        result = converted_bytes.read()
+        converted_bytes.close()
+        return result
+
     def convert_and_upload_to_s3(
         self,
-        image_path: Path,
+        image_bytes: bytes,
         target_quality: int,
         target_extension: str,
         upload_path_prefix: str,
     ) -> str:
         start_conv = time.time()
-        img_format = target_extension[1:].upper()
-        pil_image = Image.open(image_path)
-        img_bytes = BytesIO()
-        pil_image.save(img_bytes, format=img_format, quality=target_quality)
-        file_bytes = img_bytes.getvalue()
+        converted_bytes = self.convert_bytes_to_target(
+            image_bytes, target_extension, target_quality
+        )
         end_conv = time.time()
         print(
-            f"Converted image in: {round((end_conv - start_conv) *1000)} ms - {img_format} - {target_quality}"
+            f"Converted image in: {round((end_conv - start_conv) *1000)} ms - {target_extension} - {target_quality}"
         )
         key = f"{str(uuid.uuid4())}{target_extension}"
         if upload_path_prefix is not None and upload_path_prefix != "":
@@ -504,7 +516,7 @@ class RedisQueueWorker:
         content_type = self.parse_content_type(target_extension)
         start_upload = time.time()
         self.s3_client.Bucket(self.s3_bucket).put_object(
-            Body=file_bytes, Key=key, ContentType=content_type
+            Body=converted_bytes, Key=key, ContentType=content_type
         )
         end_upload = time.time()
         print(f"Uploaded image in: {round((end_upload - start_upload) *1000)} ms")
@@ -524,7 +536,7 @@ class RedisQueueWorker:
                 tasks.append(
                     executor.submit(
                         self.convert_and_upload_to_s3,
-                        uo.image_path,
+                        uo.image_bytes,
                         uo.target_quality,
                         uo.target_extension,
                         upload_path_prefix,
