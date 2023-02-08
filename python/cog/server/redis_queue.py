@@ -388,16 +388,16 @@ class RedisQueueWorker:
                             ]
 
                         if (
-                            event.payload["nsfw_count"] == 0
-                            and len(event.payload["outputs"]) == 0
+                            event.payload.nsfw_count == 0
+                            and len(event.payload.outputs) == 0
                         ):
                             raise Exception("Missing outputs and nsfw_count")
 
                         # Sometimes we could have, 0 outputs but a >0 nsfw_count
                         response["output"] = []
-                        if len(event.payload["outputs"]) > 0:
+                        if len(event.payload.outputs) > 0:
                             # Copy files to memory
-                            for output in event.payload["outputs"]:
+                            for output in event.payload.outputs:
                                 response["upload_outputs"].append(
                                     UploadObject(
                                         image_path=output.image_path,
@@ -405,7 +405,7 @@ class RedisQueueWorker:
                                         target_extension=output.target_extension,
                                     )
                                 )
-                        response["nsfw_count"] = event.payload["nsfw_count"]
+                        response["nsfw_count"] = event.payload.nsfw_count
                     except Exception as e:
                         sys.stderr.write(f"Error uploading files to S3: {e}\n")
                         had_error = True
