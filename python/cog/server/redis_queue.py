@@ -47,15 +47,11 @@ from io import BytesIO
 class UploadObject:
     def __init__(
         self,
-        image_bytes: bytes,
-        image_width: int,
-        image_height: int,
+        image_path: Path,
         target_extension: str,
         target_quality: int,
     ):
-        self.image_bytes = image_bytes
-        self.image_width = image_width
-        self.image_height = image_height
+        self.image_path = image_path
         self.target_extension = target_extension
         self.target_quality = target_quality
 
@@ -404,9 +400,7 @@ class RedisQueueWorker:
                             for output in event.payload["outputs"]:
                                 response["upload_outputs"].append(
                                     UploadObject(
-                                        image_bytes=output["image_bytes"],
-                                        image_width=output["image_width"],
-                                        image_height=output["image_height"],
+                                        image_path=output["image_path"],
                                         target_quality=output["target_quality"],
                                         target_extension=output["target_extension"],
                                     )
@@ -488,13 +482,14 @@ class RedisQueueWorker:
 
     def convert_and_upload_to_s3(
         self,
-        pil_image: Image,
+        image_path: Path,
         target_quality: int,
         target_extension: str,
         upload_path_prefix: str,
     ) -> str:
         start_conv = time.time()
         img_format = target_extension[1:].upper()
+        pil_image = Image.open(image_path)
         img_bytes = BytesIO()
         pil_image.save(img_bytes, format=img_format, quality=target_quality)
         file_bytes = img_bytes.getvalue()
@@ -526,22 +521,10 @@ class RedisQueueWorker:
         tasks: List[Future] = []
         with ThreadPoolExecutor(max_workers=len(uploadObjects)) as executor:
             for uo in uploadObjects:
-                start = time.time()
-                img_format = uo.target_extension[1:].upper()
-                mode = "RGBA"
-                if img_format == "JPEG":
-                    mode = "RGB"
-                pil_image = Image.frombytes(
-                    mode, (uo.image_width, uo.image_height), uo.image_bytes
-                )
-                pil_image.load()
-                end = time.time()
-
-                print(f"Loaded image from bytes in: {round((end - start) *1000)} ms")
                 tasks.append(
                     executor.submit(
                         self.convert_and_upload_to_s3,
-                        pil_image,
+                        uo.image_path,
                         uo.target_quality,
                         uo.target_extension,
                         upload_path_prefix,
