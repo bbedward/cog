@@ -400,9 +400,9 @@ class RedisQueueWorker:
                             for output in event.payload["outputs"]:
                                 response["upload_outputs"].append(
                                     UploadObject(
-                                        image_path=output.image_path,
-                                        target_quality=output.target_quality,
-                                        target_extension=output.target_extension,
+                                        image_path=output["image_path"],
+                                        target_quality=output["target_quality"],
+                                        target_extension=output["target_extension"],
                                     )
                                 )
                         response["nsfw_count"] = event.payload["nsfw_count"]
